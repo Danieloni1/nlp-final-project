@@ -1,203 +1,213 @@
-"""HMAC (Keyed-Hashing for Message Authentication) module.
+#
+# HMAC.py - Implements the HMAC algorithm as described by RFC 2104.
+#
+# ===================================================================
+#
+# Copyright (c) 2014, Legrandin <helderijs@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in
+#    the documentation and/or other materials provided with the
+#    distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+# ===================================================================
 
-Implements the HMAC algorithm as described by RFC 2104.
-"""
+from Crypto.Util.py3compat import bord, tobytes
 
-import warnings as _warnings
-try:
-    import _hashlib as _hashopenssl
-except ImportError:
-    _hashopenssl = None
-    _openssl_md_meths = None
-    from _operator import _compare_digest as compare_digest
-else:
-    _openssl_md_meths = frozenset(_hashopenssl.openssl_md_meth_names)
-    compare_digest = _hashopenssl.compare_digest
-import hashlib as _hashlib
+from binascii import unhexlify
 
-trans_5C = bytes((x ^ 0x5C) for x in range(256))
-trans_36 = bytes((x ^ 0x36) for x in range(256))
+from Crypto.Hash import MD5
+from Crypto.Hash import BLAKE2s
+from Crypto.Util.strxor import strxor
+from Crypto.Random import get_random_bytes
 
-# The size of the digests returned by HMAC depends on the underlying
-# hashing module used.  Use digest_size from the instance of HMAC instead.
-digest_size = None
+__all__ = ['new', 'HMAC']
 
 
+class HMAC(object):
+    """An HMAC hash object.
+    Do not instantiate directly. Use the :func:`new` function.
 
-class HMAC:
-    """RFC 2104 HMAC class.  Also complies with RFC 4231.
-
-    This supports the API for Cryptographic Hash Functions (PEP 247).
+    :ivar digest_size: the size in bytes of the resulting MAC tag
+    :vartype digest_size: integer
     """
-    blocksize = 64  # 512-bit HMAC; can be changed in subclasses.
 
-    __slots__ = (
-        "_digest_cons", "_inner", "_outer", "block_size", "digest_size"
-    )
+    def __init__(self, key, msg=b"", digestmod=None):
 
-    def __init__(self, key, msg=None, digestmod=''):
-        """Create a new HMAC object.
+        if digestmod is None:
+            digestmod = MD5
 
-        key: bytes or buffer, key for the keyed hash object.
-        msg: bytes or buffer, Initial input for the hash or None.
-        digestmod: A hash name suitable for hashlib.new(). *OR*
-                   A hashlib constructor returning a new hash object. *OR*
-                   A module supporting PEP 247.
+        if msg is None:
+            msg = b""
 
-                   Required as of 3.8, despite its position after the optional
-                   msg argument.  Passing it as a keyword argument is
-                   recommended, though not required for legacy API reasons.
-        """
+        # Size of the MAC tag
+        self.digest_size = digestmod.digest_size
 
-        if not isinstance(key, (bytes, bytearray)):
-            raise TypeError("key: expected bytes or bytearray, but got %r" % type(key).__name__)
+        self._digestmod = digestmod
 
-        if not digestmod:
-            raise TypeError("Missing required parameter 'digestmod'.")
+        if isinstance(key, memoryview):
+            key = key.tobytes()
 
-        if callable(digestmod):
-            self._digest_cons = digestmod
-        elif isinstance(digestmod, str):
-            self._digest_cons = lambda d=b'': _hashlib.new(digestmod, d)
-        else:
-            self._digest_cons = lambda d=b'': digestmod.new(d)
+        try:
+            if len(key) <= digestmod.block_size:
+                # Step 1 or 2
+                key_0 = key + b"\x00" * (digestmod.block_size - len(key))
+            else:
+                # Step 3
+                hash_k = digestmod.new(key).digest()
+                key_0 = hash_k + b"\x00" * (digestmod.block_size - len(hash_k))
+        except AttributeError:
+            # Not all hash types have "block_size"
+            raise ValueError("Hash type incompatible to HMAC")
 
-        self._outer = self._digest_cons()
-        self._inner = self._digest_cons()
-        self.digest_size = self._inner.digest_size
+        # Step 4
+        key_0_ipad = strxor(key_0, b"\x36" * len(key_0))
 
-        if hasattr(self._inner, 'block_size'):
-            blocksize = self._inner.block_size
-            if blocksize < 16:
-                _warnings.warn('block_size of %d seems too small; using our '
-                               'default of %d.' % (blocksize, self.blocksize),
-                               RuntimeWarning, 2)
-                blocksize = self.blocksize
-        else:
-            _warnings.warn('No block_size attribute on given digest object; '
-                           'Assuming %d.' % (self.blocksize),
-                           RuntimeWarning, 2)
-            blocksize = self.blocksize
-
-        # self.blocksize is the default blocksize. self.block_size is
-        # effective block size as well as the public API attribute.
-        self.block_size = blocksize
-
-        if len(key) > blocksize:
-            key = self._digest_cons(key).digest()
-
-        key = key.ljust(blocksize, b'\0')
-        self._outer.update(key.translate(trans_5C))
-        self._inner.update(key.translate(trans_36))
-        if msg is not None:
-            self.update(msg)
-
-    @property
-    def name(self):
-        return "hmac-" + self._inner.name
-
-    @property
-    def digest_cons(self):
-        return self._digest_cons
-
-    @property
-    def inner(self):
-        return self._inner
-
-    @property
-    def outer(self):
-        return self._outer
-
-    def update(self, msg):
-        """Feed data from msg into this hashing object."""
+        # Start step 5 and 6
+        self._inner = digestmod.new(key_0_ipad)
         self._inner.update(msg)
 
+        # Step 7
+        key_0_opad = strxor(key_0, b"\x5c" * len(key_0))
+
+        # Start step 8 and 9
+        self._outer = digestmod.new(key_0_opad)
+
+    def update(self, msg):
+        """Authenticate the next chunk of message.
+
+        Args:
+            data (byte string/byte array/memoryview): The next chunk of data
+        """
+
+        self._inner.update(msg)
+        return self
+
+    def _pbkdf2_hmac_assist(self, first_digest, iterations):
+        """Carry out the expensive inner loop for PBKDF2-HMAC"""
+
+        result = self._digestmod._pbkdf2_hmac_assist(
+                                    self._inner,
+                                    self._outer,
+                                    first_digest,
+                                    iterations)
+        return result
+
     def copy(self):
-        """Return a separate copy of this hashing object.
+        """Return a copy ("clone") of the HMAC object.
 
-        An update to this copy won't affect the original object.
+        The copy will have the same internal state as the original HMAC
+        object.
+        This can be used to efficiently compute the MAC tag of byte
+        strings that share a common initial substring.
+
+        :return: An :class:`HMAC`
         """
-        # Call __new__ directly to avoid the expensive __init__.
-        other = self.__class__.__new__(self.__class__)
-        other._digest_cons = self._digest_cons
-        other.digest_size = self.digest_size
-        other._inner = self._inner.copy()
-        other._outer = self._outer.copy()
-        return other
 
-    def _current(self):
-        """Return a hash object for the current state.
+        new_hmac = HMAC(b"fake key", digestmod=self._digestmod)
 
-        To be used only internally with digest() and hexdigest().
-        """
-        h = self._outer.copy()
-        h.update(self._inner.digest())
-        return h
+        # Syncronize the state
+        new_hmac._inner = self._inner.copy()
+        new_hmac._outer = self._outer.copy()
+
+        return new_hmac
 
     def digest(self):
-        """Return the hash value of this hashing object.
+        """Return the **binary** (non-printable) MAC tag of the message
+        authenticated so far.
 
-        This returns the hmac value as bytes.  The object is
-        not altered in any way by this function; you can continue
-        updating the object after calling this function.
+        :return: The MAC tag digest, computed over the data processed so far.
+                 Binary form.
+        :rtype: byte string
         """
-        h = self._current()
-        return h.digest()
+
+        frozen_outer_hash = self._outer.copy()
+        frozen_outer_hash.update(self._inner.digest())
+        return frozen_outer_hash.digest()
+
+    def verify(self, mac_tag):
+        """Verify that a given **binary** MAC (computed by another party)
+        is valid.
+
+        Args:
+          mac_tag (byte string/byte string/memoryview): the expected MAC of the message.
+
+        Raises:
+            ValueError: if the MAC does not match. It means that the message
+                has been tampered with or that the MAC key is incorrect.
+        """
+
+        secret = get_random_bytes(16)
+
+        mac1 = BLAKE2s.new(digest_bits=160, key=secret, data=mac_tag)
+        mac2 = BLAKE2s.new(digest_bits=160, key=secret, data=self.digest())
+
+        if mac1.digest() != mac2.digest():
+            raise ValueError("MAC check failed")
 
     def hexdigest(self):
-        """Like digest(), but returns a string of hexadecimal digits instead.
+        """Return the **printable** MAC tag of the message authenticated so far.
+
+        :return: The MAC tag, computed over the data processed so far.
+                 Hexadecimal encoded.
+        :rtype: string
         """
-        h = self._current()
-        return h.hexdigest()
 
-def new(key, msg=None, digestmod=''):
-    """Create a new hashing object and return it.
+        return "".join(["%02x" % bord(x)
+                        for x in tuple(self.digest())])
 
-    key: bytes or buffer, The starting key for the hash.
-    msg: bytes or buffer, Initial input for the hash, or None.
-    digestmod: A hash name suitable for hashlib.new(). *OR*
-               A hashlib constructor returning a new hash object. *OR*
-               A module supporting PEP 247.
+    def hexverify(self, hex_mac_tag):
+        """Verify that a given **printable** MAC (computed by another party)
+        is valid.
 
-               Required as of 3.8, despite its position after the optional
-               msg argument.  Passing it as a keyword argument is
-               recommended, though not required for legacy API reasons.
+        Args:
+            hex_mac_tag (string): the expected MAC of the message,
+                as a hexadecimal string.
 
-    You can now feed arbitrary bytes into the object using its update()
-    method, and can ask for the hash value at any time by calling its digest()
-    or hexdigest() methods.
+        Raises:
+            ValueError: if the MAC does not match. It means that the message
+                has been tampered with or that the MAC key is incorrect.
+        """
+
+        self.verify(unhexlify(tobytes(hex_mac_tag)))
+
+
+def new(key, msg=b"", digestmod=None):
+    """Create a new MAC object.
+
+    Args:
+        key (bytes/bytearray/memoryview):
+            key for the MAC object.
+            It must be long enough to match the expected security level of the
+            MAC.
+        msg (bytes/bytearray/memoryview):
+            Optional. The very first chunk of the message to authenticate.
+            It is equivalent to an early call to :meth:`HMAC.update`.
+        digestmod (module):
+            The hash to use to implement the HMAC.
+            Default is :mod:`Crypto.Hash.MD5`.
+
+    Returns:
+        An :class:`HMAC` object
     """
+
     return HMAC(key, msg, digestmod)
-
-
-def digest(key, msg, digest):
-    """Fast inline implementation of HMAC.
-
-    key: bytes or buffer, The key for the keyed hash object.
-    msg: bytes or buffer, Input message.
-    digest: A hash name suitable for hashlib.new() for best performance. *OR*
-            A hashlib constructor returning a new hash object. *OR*
-            A module supporting PEP 247.
-    """
-    if (_hashopenssl is not None and
-            isinstance(digest, str) and digest in _openssl_md_meths):
-        return _hashopenssl.hmac_digest(key, msg, digest)
-
-    if callable(digest):
-        digest_cons = digest
-    elif isinstance(digest, str):
-        digest_cons = lambda d=b'': _hashlib.new(digest, d)
-    else:
-        digest_cons = lambda d=b'': digest.new(d)
-
-    inner = digest_cons()
-    outer = digest_cons()
-    blocksize = getattr(inner, 'block_size', 64)
-    if len(key) > blocksize:
-        key = digest_cons(key).digest()
-    key = key + b'\x00' * (blocksize - len(key))
-    inner.update(key.translate(trans_36))
-    outer.update(key.translate(trans_5C))
-    inner.update(msg)
-    outer.update(inner.digest())
-    return outer.digest()

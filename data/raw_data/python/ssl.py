@@ -1,1489 +1,2432 @@
-# Wrapper module for _ssl, providing some additional facilities
-# implemented in Python.  Written by Bill Janssen.
-
-"""This module provides some more Pythonic support for SSL.
-
-Object types:
-
-  SSLSocket -- subtype of socket.socket which does SSL over the socket
-
-Exceptions:
-
-  SSLError -- exception raised for I/O errors
-
-Functions:
-
-  cert_time_to_seconds -- convert time string used for certificate
-                          notBefore and notAfter functions to integer
-                          seconds past the Epoch (the time values
-                          returned from time.time())
-
-  fetch_server_certificate (HOST, PORT) -- fetch the certificate provided
-                          by the server running on HOST at port PORT.  No
-                          validation of the certificate is performed.
-
-Integer constants:
-
-SSL_ERROR_ZERO_RETURN
-SSL_ERROR_WANT_READ
-SSL_ERROR_WANT_WRITE
-SSL_ERROR_WANT_X509_LOOKUP
-SSL_ERROR_SYSCALL
-SSL_ERROR_SSL
-SSL_ERROR_WANT_CONNECT
-
-SSL_ERROR_EOF
-SSL_ERROR_INVALID_ERROR_CODE
-
-The following group define certificate requirements that one side is
-allowing/requiring from the other side:
-
-CERT_NONE - no certificates from the other side are required (or will
-            be looked at if provided)
-CERT_OPTIONAL - certificates are not required, but if provided will be
-                validated, and if validation fails, the connection will
-                also fail
-CERT_REQUIRED - certificates are required, and will be validated, and
-                if validation fails, the connection will also fail
-
-The following constants identify various SSL protocol variants:
-
-PROTOCOL_SSLv2
-PROTOCOL_SSLv3
-PROTOCOL_SSLv23
-PROTOCOL_TLS
-PROTOCOL_TLS_CLIENT
-PROTOCOL_TLS_SERVER
-PROTOCOL_TLSv1
-PROTOCOL_TLSv1_1
-PROTOCOL_TLSv1_2
-
-The following constants identify various SSL alert message descriptions as per
-http://www.iana.org/assignments/tls-parameters/tls-parameters.xml#tls-parameters-6
-
-ALERT_DESCRIPTION_CLOSE_NOTIFY
-ALERT_DESCRIPTION_UNEXPECTED_MESSAGE
-ALERT_DESCRIPTION_BAD_RECORD_MAC
-ALERT_DESCRIPTION_RECORD_OVERFLOW
-ALERT_DESCRIPTION_DECOMPRESSION_FAILURE
-ALERT_DESCRIPTION_HANDSHAKE_FAILURE
-ALERT_DESCRIPTION_BAD_CERTIFICATE
-ALERT_DESCRIPTION_UNSUPPORTED_CERTIFICATE
-ALERT_DESCRIPTION_CERTIFICATE_REVOKED
-ALERT_DESCRIPTION_CERTIFICATE_EXPIRED
-ALERT_DESCRIPTION_CERTIFICATE_UNKNOWN
-ALERT_DESCRIPTION_ILLEGAL_PARAMETER
-ALERT_DESCRIPTION_UNKNOWN_CA
-ALERT_DESCRIPTION_ACCESS_DENIED
-ALERT_DESCRIPTION_DECODE_ERROR
-ALERT_DESCRIPTION_DECRYPT_ERROR
-ALERT_DESCRIPTION_PROTOCOL_VERSION
-ALERT_DESCRIPTION_INSUFFICIENT_SECURITY
-ALERT_DESCRIPTION_INTERNAL_ERROR
-ALERT_DESCRIPTION_USER_CANCELLED
-ALERT_DESCRIPTION_NO_RENEGOTIATION
-ALERT_DESCRIPTION_UNSUPPORTED_EXTENSION
-ALERT_DESCRIPTION_CERTIFICATE_UNOBTAINABLE
-ALERT_DESCRIPTION_UNRECOGNIZED_NAME
-ALERT_DESCRIPTION_BAD_CERTIFICATE_STATUS_RESPONSE
-ALERT_DESCRIPTION_BAD_CERTIFICATE_HASH_VALUE
-ALERT_DESCRIPTION_UNKNOWN_PSK_IDENTITY
-"""
-
-import sys
 import os
-from collections import namedtuple
-from enum import Enum as _Enum, IntEnum as _IntEnum, IntFlag as _IntFlag
+import socket
+from sys import platform
+from functools import wraps, partial
+from itertools import count, chain
+from weakref import WeakValueDictionary
+from errno import errorcode
 
-import _ssl             # if we can't import it, let the error propagate
+from six import integer_types, int2byte, indexbytes
 
-from _ssl import OPENSSL_VERSION_NUMBER, OPENSSL_VERSION_INFO, OPENSSL_VERSION
-from _ssl import _SSLContext, MemoryBIO, SSLSession
-from _ssl import (
-    SSLError, SSLZeroReturnError, SSLWantReadError, SSLWantWriteError,
-    SSLSyscallError, SSLEOFError, SSLCertVerificationError
-    )
-from _ssl import txt2obj as _txt2obj, nid2obj as _nid2obj
-from _ssl import RAND_status, RAND_add, RAND_bytes, RAND_pseudo_bytes
+from OpenSSL._util import (
+    UNSPECIFIED as _UNSPECIFIED,
+    exception_from_error_queue as _exception_from_error_queue,
+    ffi as _ffi,
+    from_buffer as _from_buffer,
+    lib as _lib,
+    make_assert as _make_assert,
+    native as _native,
+    path_string as _path_string,
+    text_to_bytes_and_warn as _text_to_bytes_and_warn,
+    no_zero_allocator as _no_zero_allocator,
+)
+
+from OpenSSL.crypto import (
+    FILETYPE_PEM,
+    _PassphraseHelper,
+    PKey,
+    X509Name,
+    X509,
+    X509Store,
+)
+
+__all__ = [
+    "OPENSSL_VERSION_NUMBER",
+    "SSLEAY_VERSION",
+    "SSLEAY_CFLAGS",
+    "SSLEAY_PLATFORM",
+    "SSLEAY_DIR",
+    "SSLEAY_BUILT_ON",
+    "SENT_SHUTDOWN",
+    "RECEIVED_SHUTDOWN",
+    "SSLv2_METHOD",
+    "SSLv3_METHOD",
+    "SSLv23_METHOD",
+    "TLSv1_METHOD",
+    "TLSv1_1_METHOD",
+    "TLSv1_2_METHOD",
+    "OP_NO_SSLv2",
+    "OP_NO_SSLv3",
+    "OP_NO_TLSv1",
+    "OP_NO_TLSv1_1",
+    "OP_NO_TLSv1_2",
+    "OP_NO_TLSv1_3",
+    "MODE_RELEASE_BUFFERS",
+    "OP_SINGLE_DH_USE",
+    "OP_SINGLE_ECDH_USE",
+    "OP_EPHEMERAL_RSA",
+    "OP_MICROSOFT_SESS_ID_BUG",
+    "OP_NETSCAPE_CHALLENGE_BUG",
+    "OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG",
+    "OP_SSLREF2_REUSE_CERT_TYPE_BUG",
+    "OP_MICROSOFT_BIG_SSLV3_BUFFER",
+    "OP_MSIE_SSLV2_RSA_PADDING",
+    "OP_SSLEAY_080_CLIENT_DH_BUG",
+    "OP_TLS_D5_BUG",
+    "OP_TLS_BLOCK_PADDING_BUG",
+    "OP_DONT_INSERT_EMPTY_FRAGMENTS",
+    "OP_CIPHER_SERVER_PREFERENCE",
+    "OP_TLS_ROLLBACK_BUG",
+    "OP_PKCS1_CHECK_1",
+    "OP_PKCS1_CHECK_2",
+    "OP_NETSCAPE_CA_DN_BUG",
+    "OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG",
+    "OP_NO_COMPRESSION",
+    "OP_NO_QUERY_MTU",
+    "OP_COOKIE_EXCHANGE",
+    "OP_NO_TICKET",
+    "OP_ALL",
+    "VERIFY_PEER",
+    "VERIFY_FAIL_IF_NO_PEER_CERT",
+    "VERIFY_CLIENT_ONCE",
+    "VERIFY_NONE",
+    "SESS_CACHE_OFF",
+    "SESS_CACHE_CLIENT",
+    "SESS_CACHE_SERVER",
+    "SESS_CACHE_BOTH",
+    "SESS_CACHE_NO_AUTO_CLEAR",
+    "SESS_CACHE_NO_INTERNAL_LOOKUP",
+    "SESS_CACHE_NO_INTERNAL_STORE",
+    "SESS_CACHE_NO_INTERNAL",
+    "SSL_ST_CONNECT",
+    "SSL_ST_ACCEPT",
+    "SSL_ST_MASK",
+    "SSL_CB_LOOP",
+    "SSL_CB_EXIT",
+    "SSL_CB_READ",
+    "SSL_CB_WRITE",
+    "SSL_CB_ALERT",
+    "SSL_CB_READ_ALERT",
+    "SSL_CB_WRITE_ALERT",
+    "SSL_CB_ACCEPT_LOOP",
+    "SSL_CB_ACCEPT_EXIT",
+    "SSL_CB_CONNECT_LOOP",
+    "SSL_CB_CONNECT_EXIT",
+    "SSL_CB_HANDSHAKE_START",
+    "SSL_CB_HANDSHAKE_DONE",
+    "Error",
+    "WantReadError",
+    "WantWriteError",
+    "WantX509LookupError",
+    "ZeroReturnError",
+    "SysCallError",
+    "SSLeay_version",
+    "Session",
+    "Context",
+    "Connection",
+]
+
 try:
-    from _ssl import RAND_egd
-except ImportError:
-    # LibreSSL does not provide RAND_egd
+    _buffer = buffer
+except NameError:
+
+    class _buffer(object):
+        pass
+
+
+OPENSSL_VERSION_NUMBER = _lib.OPENSSL_VERSION_NUMBER
+SSLEAY_VERSION = _lib.SSLEAY_VERSION
+SSLEAY_CFLAGS = _lib.SSLEAY_CFLAGS
+SSLEAY_PLATFORM = _lib.SSLEAY_PLATFORM
+SSLEAY_DIR = _lib.SSLEAY_DIR
+SSLEAY_BUILT_ON = _lib.SSLEAY_BUILT_ON
+
+SENT_SHUTDOWN = _lib.SSL_SENT_SHUTDOWN
+RECEIVED_SHUTDOWN = _lib.SSL_RECEIVED_SHUTDOWN
+
+SSLv2_METHOD = 1
+SSLv3_METHOD = 2
+SSLv23_METHOD = 3
+TLSv1_METHOD = 4
+TLSv1_1_METHOD = 5
+TLSv1_2_METHOD = 6
+
+OP_NO_SSLv2 = _lib.SSL_OP_NO_SSLv2
+OP_NO_SSLv3 = _lib.SSL_OP_NO_SSLv3
+OP_NO_TLSv1 = _lib.SSL_OP_NO_TLSv1
+OP_NO_TLSv1_1 = _lib.SSL_OP_NO_TLSv1_1
+OP_NO_TLSv1_2 = _lib.SSL_OP_NO_TLSv1_2
+try:
+    OP_NO_TLSv1_3 = _lib.SSL_OP_NO_TLSv1_3
+except AttributeError:
+    pass
+
+MODE_RELEASE_BUFFERS = _lib.SSL_MODE_RELEASE_BUFFERS
+
+OP_SINGLE_DH_USE = _lib.SSL_OP_SINGLE_DH_USE
+OP_SINGLE_ECDH_USE = _lib.SSL_OP_SINGLE_ECDH_USE
+OP_EPHEMERAL_RSA = _lib.SSL_OP_EPHEMERAL_RSA
+OP_MICROSOFT_SESS_ID_BUG = _lib.SSL_OP_MICROSOFT_SESS_ID_BUG
+OP_NETSCAPE_CHALLENGE_BUG = _lib.SSL_OP_NETSCAPE_CHALLENGE_BUG
+OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG = (
+    _lib.SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG
+)
+OP_SSLREF2_REUSE_CERT_TYPE_BUG = _lib.SSL_OP_SSLREF2_REUSE_CERT_TYPE_BUG
+OP_MICROSOFT_BIG_SSLV3_BUFFER = _lib.SSL_OP_MICROSOFT_BIG_SSLV3_BUFFER
+OP_MSIE_SSLV2_RSA_PADDING = _lib.SSL_OP_MSIE_SSLV2_RSA_PADDING
+OP_SSLEAY_080_CLIENT_DH_BUG = _lib.SSL_OP_SSLEAY_080_CLIENT_DH_BUG
+OP_TLS_D5_BUG = _lib.SSL_OP_TLS_D5_BUG
+OP_TLS_BLOCK_PADDING_BUG = _lib.SSL_OP_TLS_BLOCK_PADDING_BUG
+OP_DONT_INSERT_EMPTY_FRAGMENTS = _lib.SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS
+OP_CIPHER_SERVER_PREFERENCE = _lib.SSL_OP_CIPHER_SERVER_PREFERENCE
+OP_TLS_ROLLBACK_BUG = _lib.SSL_OP_TLS_ROLLBACK_BUG
+OP_PKCS1_CHECK_1 = _lib.SSL_OP_PKCS1_CHECK_1
+OP_PKCS1_CHECK_2 = _lib.SSL_OP_PKCS1_CHECK_2
+OP_NETSCAPE_CA_DN_BUG = _lib.SSL_OP_NETSCAPE_CA_DN_BUG
+OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG = (
+    _lib.SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG
+)
+OP_NO_COMPRESSION = _lib.SSL_OP_NO_COMPRESSION
+
+OP_NO_QUERY_MTU = _lib.SSL_OP_NO_QUERY_MTU
+OP_COOKIE_EXCHANGE = _lib.SSL_OP_COOKIE_EXCHANGE
+OP_NO_TICKET = _lib.SSL_OP_NO_TICKET
+
+OP_ALL = _lib.SSL_OP_ALL
+
+VERIFY_PEER = _lib.SSL_VERIFY_PEER
+VERIFY_FAIL_IF_NO_PEER_CERT = _lib.SSL_VERIFY_FAIL_IF_NO_PEER_CERT
+VERIFY_CLIENT_ONCE = _lib.SSL_VERIFY_CLIENT_ONCE
+VERIFY_NONE = _lib.SSL_VERIFY_NONE
+
+SESS_CACHE_OFF = _lib.SSL_SESS_CACHE_OFF
+SESS_CACHE_CLIENT = _lib.SSL_SESS_CACHE_CLIENT
+SESS_CACHE_SERVER = _lib.SSL_SESS_CACHE_SERVER
+SESS_CACHE_BOTH = _lib.SSL_SESS_CACHE_BOTH
+SESS_CACHE_NO_AUTO_CLEAR = _lib.SSL_SESS_CACHE_NO_AUTO_CLEAR
+SESS_CACHE_NO_INTERNAL_LOOKUP = _lib.SSL_SESS_CACHE_NO_INTERNAL_LOOKUP
+SESS_CACHE_NO_INTERNAL_STORE = _lib.SSL_SESS_CACHE_NO_INTERNAL_STORE
+SESS_CACHE_NO_INTERNAL = _lib.SSL_SESS_CACHE_NO_INTERNAL
+
+SSL_ST_CONNECT = _lib.SSL_ST_CONNECT
+SSL_ST_ACCEPT = _lib.SSL_ST_ACCEPT
+SSL_ST_MASK = _lib.SSL_ST_MASK
+
+SSL_CB_LOOP = _lib.SSL_CB_LOOP
+SSL_CB_EXIT = _lib.SSL_CB_EXIT
+SSL_CB_READ = _lib.SSL_CB_READ
+SSL_CB_WRITE = _lib.SSL_CB_WRITE
+SSL_CB_ALERT = _lib.SSL_CB_ALERT
+SSL_CB_READ_ALERT = _lib.SSL_CB_READ_ALERT
+SSL_CB_WRITE_ALERT = _lib.SSL_CB_WRITE_ALERT
+SSL_CB_ACCEPT_LOOP = _lib.SSL_CB_ACCEPT_LOOP
+SSL_CB_ACCEPT_EXIT = _lib.SSL_CB_ACCEPT_EXIT
+SSL_CB_CONNECT_LOOP = _lib.SSL_CB_CONNECT_LOOP
+SSL_CB_CONNECT_EXIT = _lib.SSL_CB_CONNECT_EXIT
+SSL_CB_HANDSHAKE_START = _lib.SSL_CB_HANDSHAKE_START
+SSL_CB_HANDSHAKE_DONE = _lib.SSL_CB_HANDSHAKE_DONE
+
+# Taken from https://golang.org/src/crypto/x509/root_linux.go
+_CERTIFICATE_FILE_LOCATIONS = [
+    "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu/Gentoo etc.
+    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora/RHEL 6
+    "/etc/ssl/ca-bundle.pem",  # OpenSUSE
+    "/etc/pki/tls/cacert.pem",  # OpenELEC
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  # CentOS/RHEL 7
+]
+
+_CERTIFICATE_PATH_LOCATIONS = [
+    "/etc/ssl/certs",  # SLES10/SLES11
+]
+
+# These values are compared to output from cffi's ffi.string so they must be
+# byte strings.
+_CRYPTOGRAPHY_MANYLINUX1_CA_DIR = b"/opt/pyca/cryptography/openssl/certs"
+_CRYPTOGRAPHY_MANYLINUX1_CA_FILE = b"/opt/pyca/cryptography/openssl/cert.pem"
+
+
+class Error(Exception):
+    """
+    An error occurred in an `OpenSSL.SSL` API.
+    """
+
+
+_raise_current_error = partial(_exception_from_error_queue, Error)
+_openssl_assert = _make_assert(Error)
+
+
+class WantReadError(Error):
     pass
 
 
-from _ssl import (
-    HAS_SNI, HAS_ECDH, HAS_NPN, HAS_ALPN, HAS_SSLv2, HAS_SSLv3, HAS_TLSv1,
-    HAS_TLSv1_1, HAS_TLSv1_2, HAS_TLSv1_3
+class WantWriteError(Error):
+    pass
+
+
+class WantX509LookupError(Error):
+    pass
+
+
+class ZeroReturnError(Error):
+    pass
+
+
+class SysCallError(Error):
+    pass
+
+
+class _CallbackExceptionHelper(object):
+    """
+    A base class for wrapper classes that allow for intelligent exception
+    handling in OpenSSL callbacks.
+
+    :ivar list _problems: Any exceptions that occurred while executing in a
+        context where they could not be raised in the normal way.  Typically
+        this is because OpenSSL has called into some Python code and requires a
+        return value.  The exceptions are saved to be raised later when it is
+        possible to do so.
+    """
+
+    def __init__(self):
+        self._problems = []
+
+    def raise_if_problem(self):
+        """
+        Raise an exception from the OpenSSL error queue or that was previously
+        captured whe running a callback.
+        """
+        if self._problems:
+            try:
+                _raise_current_error()
+            except Error:
+                pass
+            raise self._problems.pop(0)
+
+
+class _VerifyHelper(_CallbackExceptionHelper):
+    """
+    Wrap a callback such that it can be used as a certificate verification
+    callback.
+    """
+
+    def __init__(self, callback):
+        _CallbackExceptionHelper.__init__(self)
+
+        @wraps(callback)
+        def wrapper(ok, store_ctx):
+            x509 = _lib.X509_STORE_CTX_get_current_cert(store_ctx)
+            _lib.X509_up_ref(x509)
+            cert = X509._from_raw_x509_ptr(x509)
+            error_number = _lib.X509_STORE_CTX_get_error(store_ctx)
+            error_depth = _lib.X509_STORE_CTX_get_error_depth(store_ctx)
+
+            index = _lib.SSL_get_ex_data_X509_STORE_CTX_idx()
+            ssl = _lib.X509_STORE_CTX_get_ex_data(store_ctx, index)
+            connection = Connection._reverse_mapping[ssl]
+
+            try:
+                result = callback(
+                    connection, cert, error_number, error_depth, ok
+                )
+            except Exception as e:
+                self._problems.append(e)
+                return 0
+            else:
+                if result:
+                    _lib.X509_STORE_CTX_set_error(store_ctx, _lib.X509_V_OK)
+                    return 1
+                else:
+                    return 0
+
+        self.callback = _ffi.callback(
+            "int (*)(int, X509_STORE_CTX *)", wrapper
+        )
+
+
+NO_OVERLAPPING_PROTOCOLS = object()
+
+
+class _ALPNSelectHelper(_CallbackExceptionHelper):
+    """
+    Wrap a callback such that it can be used as an ALPN selection callback.
+    """
+
+    def __init__(self, callback):
+        _CallbackExceptionHelper.__init__(self)
+
+        @wraps(callback)
+        def wrapper(ssl, out, outlen, in_, inlen, arg):
+            try:
+                conn = Connection._reverse_mapping[ssl]
+
+                # The string passed to us is made up of multiple
+                # length-prefixed bytestrings. We need to split that into a
+                # list.
+                instr = _ffi.buffer(in_, inlen)[:]
+                protolist = []
+                while instr:
+                    encoded_len = indexbytes(instr, 0)
+                    proto = instr[1 : encoded_len + 1]
+                    protolist.append(proto)
+                    instr = instr[encoded_len + 1 :]
+
+                # Call the callback
+                outbytes = callback(conn, protolist)
+                any_accepted = True
+                if outbytes is NO_OVERLAPPING_PROTOCOLS:
+                    outbytes = b""
+                    any_accepted = False
+                elif not isinstance(outbytes, bytes):
+                    raise TypeError(
+                        "ALPN callback must return a bytestring or the "
+                        "special NO_OVERLAPPING_PROTOCOLS sentinel value."
+                    )
+
+                # Save our callback arguments on the connection object to make
+                # sure that they don't get freed before OpenSSL can use them.
+                # Then, return them in the appropriate output parameters.
+                conn._alpn_select_callback_args = [
+                    _ffi.new("unsigned char *", len(outbytes)),
+                    _ffi.new("unsigned char[]", outbytes),
+                ]
+                outlen[0] = conn._alpn_select_callback_args[0][0]
+                out[0] = conn._alpn_select_callback_args[1]
+                if not any_accepted:
+                    return _lib.SSL_TLSEXT_ERR_NOACK
+                return _lib.SSL_TLSEXT_ERR_OK
+            except Exception as e:
+                self._problems.append(e)
+                return _lib.SSL_TLSEXT_ERR_ALERT_FATAL
+
+        self.callback = _ffi.callback(
+            (
+                "int (*)(SSL *, unsigned char **, unsigned char *, "
+                "const unsigned char *, unsigned int, void *)"
+            ),
+            wrapper,
+        )
+
+
+class _OCSPServerCallbackHelper(_CallbackExceptionHelper):
+    """
+    Wrap a callback such that it can be used as an OCSP callback for the server
+    side.
+
+    Annoyingly, OpenSSL defines one OCSP callback but uses it in two different
+    ways. For servers, that callback is expected to retrieve some OCSP data and
+    hand it to OpenSSL, and may return only SSL_TLSEXT_ERR_OK,
+    SSL_TLSEXT_ERR_FATAL, and SSL_TLSEXT_ERR_NOACK. For clients, that callback
+    is expected to check the OCSP data, and returns a negative value on error,
+    0 if the response is not acceptable, or positive if it is. These are
+    mutually exclusive return code behaviours, and they mean that we need two
+    helpers so that we always return an appropriate error code if the user's
+    code throws an exception.
+
+    Given that we have to have two helpers anyway, these helpers are a bit more
+    helpery than most: specifically, they hide a few more of the OpenSSL
+    functions so that the user has an easier time writing these callbacks.
+
+    This helper implements the server side.
+    """
+
+    def __init__(self, callback):
+        _CallbackExceptionHelper.__init__(self)
+
+        @wraps(callback)
+        def wrapper(ssl, cdata):
+            try:
+                conn = Connection._reverse_mapping[ssl]
+
+                # Extract the data if any was provided.
+                if cdata != _ffi.NULL:
+                    data = _ffi.from_handle(cdata)
+                else:
+                    data = None
+
+                # Call the callback.
+                ocsp_data = callback(conn, data)
+
+                if not isinstance(ocsp_data, bytes):
+                    raise TypeError("OCSP callback must return a bytestring.")
+
+                # If the OCSP data was provided, we will pass it to OpenSSL.
+                # However, we have an early exit here: if no OCSP data was
+                # provided we will just exit out and tell OpenSSL that there
+                # is nothing to do.
+                if not ocsp_data:
+                    return 3  # SSL_TLSEXT_ERR_NOACK
+
+                # OpenSSL takes ownership of this data and expects it to have
+                # been allocated by OPENSSL_malloc.
+                ocsp_data_length = len(ocsp_data)
+                data_ptr = _lib.OPENSSL_malloc(ocsp_data_length)
+                _ffi.buffer(data_ptr, ocsp_data_length)[:] = ocsp_data
+
+                _lib.SSL_set_tlsext_status_ocsp_resp(
+                    ssl, data_ptr, ocsp_data_length
+                )
+
+                return 0
+            except Exception as e:
+                self._problems.append(e)
+                return 2  # SSL_TLSEXT_ERR_ALERT_FATAL
+
+        self.callback = _ffi.callback("int (*)(SSL *, void *)", wrapper)
+
+
+class _OCSPClientCallbackHelper(_CallbackExceptionHelper):
+    """
+    Wrap a callback such that it can be used as an OCSP callback for the client
+    side.
+
+    Annoyingly, OpenSSL defines one OCSP callback but uses it in two different
+    ways. For servers, that callback is expected to retrieve some OCSP data and
+    hand it to OpenSSL, and may return only SSL_TLSEXT_ERR_OK,
+    SSL_TLSEXT_ERR_FATAL, and SSL_TLSEXT_ERR_NOACK. For clients, that callback
+    is expected to check the OCSP data, and returns a negative value on error,
+    0 if the response is not acceptable, or positive if it is. These are
+    mutually exclusive return code behaviours, and they mean that we need two
+    helpers so that we always return an appropriate error code if the user's
+    code throws an exception.
+
+    Given that we have to have two helpers anyway, these helpers are a bit more
+    helpery than most: specifically, they hide a few more of the OpenSSL
+    functions so that the user has an easier time writing these callbacks.
+
+    This helper implements the client side.
+    """
+
+    def __init__(self, callback):
+        _CallbackExceptionHelper.__init__(self)
+
+        @wraps(callback)
+        def wrapper(ssl, cdata):
+            try:
+                conn = Connection._reverse_mapping[ssl]
+
+                # Extract the data if any was provided.
+                if cdata != _ffi.NULL:
+                    data = _ffi.from_handle(cdata)
+                else:
+                    data = None
+
+                # Get the OCSP data.
+                ocsp_ptr = _ffi.new("unsigned char **")
+                ocsp_len = _lib.SSL_get_tlsext_status_ocsp_resp(ssl, ocsp_ptr)
+                if ocsp_len < 0:
+                    # No OCSP data.
+                    ocsp_data = b""
+                else:
+                    # Copy the OCSP data, then pass it to the callback.
+                    ocsp_data = _ffi.buffer(ocsp_ptr[0], ocsp_len)[:]
+
+                valid = callback(conn, ocsp_data, data)
+
+                # Return 1 on success or 0 on error.
+                return int(bool(valid))
+
+            except Exception as e:
+                self._problems.append(e)
+                # Return negative value if an exception is hit.
+                return -1
+
+        self.callback = _ffi.callback("int (*)(SSL *, void *)", wrapper)
+
+
+def _asFileDescriptor(obj):
+    fd = None
+    if not isinstance(obj, integer_types):
+        meth = getattr(obj, "fileno", None)
+        if meth is not None:
+            obj = meth()
+
+    if isinstance(obj, integer_types):
+        fd = obj
+
+    if not isinstance(fd, integer_types):
+        raise TypeError("argument must be an int, or have a fileno() method.")
+    elif fd < 0:
+        raise ValueError(
+            "file descriptor cannot be a negative integer (%i)" % (fd,)
+        )
+
+    return fd
+
+
+def SSLeay_version(type):
+    """
+    Return a string describing the version of OpenSSL in use.
+
+    :param type: One of the :const:`SSLEAY_` constants defined in this module.
+    """
+    return _ffi.string(_lib.SSLeay_version(type))
+
+
+def _make_requires(flag, error):
+    """
+    Builds a decorator that ensures that functions that rely on OpenSSL
+    functions that are not present in this build raise NotImplementedError,
+    rather than AttributeError coming out of cryptography.
+
+    :param flag: A cryptography flag that guards the functions, e.g.
+        ``Cryptography_HAS_NEXTPROTONEG``.
+    :param error: The string to be used in the exception if the flag is false.
+    """
+
+    def _requires_decorator(func):
+        if not flag:
+
+            @wraps(func)
+            def explode(*args, **kwargs):
+                raise NotImplementedError(error)
+
+            return explode
+        else:
+            return func
+
+    return _requires_decorator
+
+
+_requires_alpn = _make_requires(
+    _lib.Cryptography_HAS_ALPN, "ALPN not available"
 )
-from _ssl import _DEFAULT_CIPHERS, _OPENSSL_API_VERSION
 
 
-_IntEnum._convert_(
-    '_SSLMethod', __name__,
-    lambda name: name.startswith('PROTOCOL_') and name != 'PROTOCOL_SSLv23',
-    source=_ssl)
-
-_IntFlag._convert_(
-    'Options', __name__,
-    lambda name: name.startswith('OP_'),
-    source=_ssl)
-
-_IntEnum._convert_(
-    'AlertDescription', __name__,
-    lambda name: name.startswith('ALERT_DESCRIPTION_'),
-    source=_ssl)
-
-_IntEnum._convert_(
-    'SSLErrorNumber', __name__,
-    lambda name: name.startswith('SSL_ERROR_'),
-    source=_ssl)
-
-_IntFlag._convert_(
-    'VerifyFlags', __name__,
-    lambda name: name.startswith('VERIFY_'),
-    source=_ssl)
-
-_IntEnum._convert_(
-    'VerifyMode', __name__,
-    lambda name: name.startswith('CERT_'),
-    source=_ssl)
-
-PROTOCOL_SSLv23 = _SSLMethod.PROTOCOL_SSLv23 = _SSLMethod.PROTOCOL_TLS
-_PROTOCOL_NAMES = {value: name for name, value in _SSLMethod.__members__.items()}
-
-_SSLv2_IF_EXISTS = getattr(_SSLMethod, 'PROTOCOL_SSLv2', None)
+_requires_keylog = _make_requires(
+    getattr(_lib, "Cryptography_HAS_KEYLOG", None), "Key logging not available"
+)
 
 
-class TLSVersion(_IntEnum):
-    MINIMUM_SUPPORTED = _ssl.PROTO_MINIMUM_SUPPORTED
-    SSLv3 = _ssl.PROTO_SSLv3
-    TLSv1 = _ssl.PROTO_TLSv1
-    TLSv1_1 = _ssl.PROTO_TLSv1_1
-    TLSv1_2 = _ssl.PROTO_TLSv1_2
-    TLSv1_3 = _ssl.PROTO_TLSv1_3
-    MAXIMUM_SUPPORTED = _ssl.PROTO_MAXIMUM_SUPPORTED
-
-
-class _TLSContentType(_IntEnum):
-    """Content types (record layer)
-
-    See RFC 8446, section B.1
+class Session(object):
     """
-    CHANGE_CIPHER_SPEC = 20
-    ALERT = 21
-    HANDSHAKE = 22
-    APPLICATION_DATA = 23
-    # pseudo content types
-    HEADER = 0x100
-    INNER_CONTENT_TYPE = 0x101
+    A class representing an SSL session.  A session defines certain connection
+    parameters which may be re-used to speed up the setup of subsequent
+    connections.
 
-
-class _TLSAlertType(_IntEnum):
-    """Alert types for TLSContentType.ALERT messages
-
-    See RFC 8466, section B.2
+    .. versionadded:: 0.14
     """
-    CLOSE_NOTIFY = 0
-    UNEXPECTED_MESSAGE = 10
-    BAD_RECORD_MAC = 20
-    DECRYPTION_FAILED = 21
-    RECORD_OVERFLOW = 22
-    DECOMPRESSION_FAILURE = 30
-    HANDSHAKE_FAILURE = 40
-    NO_CERTIFICATE = 41
-    BAD_CERTIFICATE = 42
-    UNSUPPORTED_CERTIFICATE = 43
-    CERTIFICATE_REVOKED = 44
-    CERTIFICATE_EXPIRED = 45
-    CERTIFICATE_UNKNOWN = 46
-    ILLEGAL_PARAMETER = 47
-    UNKNOWN_CA = 48
-    ACCESS_DENIED = 49
-    DECODE_ERROR = 50
-    DECRYPT_ERROR = 51
-    EXPORT_RESTRICTION = 60
-    PROTOCOL_VERSION = 70
-    INSUFFICIENT_SECURITY = 71
-    INTERNAL_ERROR = 80
-    INAPPROPRIATE_FALLBACK = 86
-    USER_CANCELED = 90
-    NO_RENEGOTIATION = 100
-    MISSING_EXTENSION = 109
-    UNSUPPORTED_EXTENSION = 110
-    CERTIFICATE_UNOBTAINABLE = 111
-    UNRECOGNIZED_NAME = 112
-    BAD_CERTIFICATE_STATUS_RESPONSE = 113
-    BAD_CERTIFICATE_HASH_VALUE = 114
-    UNKNOWN_PSK_IDENTITY = 115
-    CERTIFICATE_REQUIRED = 116
-    NO_APPLICATION_PROTOCOL = 120
+
+    pass
 
 
-class _TLSMessageType(_IntEnum):
-    """Message types (handshake protocol)
-
-    See RFC 8446, section B.3
+class Context(object):
     """
-    HELLO_REQUEST = 0
-    CLIENT_HELLO = 1
-    SERVER_HELLO = 2
-    HELLO_VERIFY_REQUEST = 3
-    NEWSESSION_TICKET = 4
-    END_OF_EARLY_DATA = 5
-    HELLO_RETRY_REQUEST = 6
-    ENCRYPTED_EXTENSIONS = 8
-    CERTIFICATE = 11
-    SERVER_KEY_EXCHANGE = 12
-    CERTIFICATE_REQUEST = 13
-    SERVER_DONE = 14
-    CERTIFICATE_VERIFY = 15
-    CLIENT_KEY_EXCHANGE = 16
-    FINISHED = 20
-    CERTIFICATE_URL = 21
-    CERTIFICATE_STATUS = 22
-    SUPPLEMENTAL_DATA = 23
-    KEY_UPDATE = 24
-    NEXT_PROTO = 67
-    MESSAGE_HASH = 254
-    CHANGE_CIPHER_SPEC = 0x0101
+    :class:`OpenSSL.SSL.Context` instances define the parameters for setting
+    up new SSL connections.
 
-
-if sys.platform == "win32":
-    from _ssl import enum_certificates, enum_crls
-
-from socket import socket, SOCK_STREAM, create_connection
-from socket import SOL_SOCKET, SO_TYPE
-import socket as _socket
-import base64        # for DER-to-PEM translation
-import errno
-import warnings
-
-
-socket_error = OSError  # keep that public name in module namespace
-
-CHANNEL_BINDING_TYPES = ['tls-unique']
-
-HAS_NEVER_CHECK_COMMON_NAME = hasattr(_ssl, 'HOSTFLAG_NEVER_CHECK_SUBJECT')
-
-
-_RESTRICTED_SERVER_CIPHERS = _DEFAULT_CIPHERS
-
-CertificateError = SSLCertVerificationError
-
-
-def _dnsname_match(dn, hostname):
-    """Matching according to RFC 6125, section 6.4.3
-
-    - Hostnames are compared lower case.
-    - For IDNA, both dn and hostname must be encoded as IDN A-label (ACE).
-    - Partial wildcards like 'www*.example.org', multiple wildcards, sole
-      wildcard or wildcards in labels other then the left-most label are not
-      supported and a CertificateError is raised.
-    - A wildcard must match at least one character.
+    :param method: One of SSLv2_METHOD, SSLv3_METHOD, SSLv23_METHOD, or
+        TLSv1_METHOD.
     """
-    if not dn:
-        return False
 
-    wildcards = dn.count('*')
-    # speed up common case w/o wildcards
-    if not wildcards:
-        return dn.lower() == hostname.lower()
+    _methods = {
+        SSLv2_METHOD: "SSLv2_method",
+        SSLv3_METHOD: "SSLv3_method",
+        SSLv23_METHOD: "SSLv23_method",
+        TLSv1_METHOD: "TLSv1_method",
+        TLSv1_1_METHOD: "TLSv1_1_method",
+        TLSv1_2_METHOD: "TLSv1_2_method",
+    }
+    _methods = dict(
+        (identifier, getattr(_lib, name))
+        for (identifier, name) in _methods.items()
+        if getattr(_lib, name, None) is not None
+    )
 
-    if wildcards > 1:
-        raise CertificateError(
-            "too many wildcards in certificate DNS name: {!r}.".format(dn))
+    def __init__(self, method):
+        if not isinstance(method, integer_types):
+            raise TypeError("method must be an integer")
 
-    dn_leftmost, sep, dn_remainder = dn.partition('.')
-
-    if '*' in dn_remainder:
-        # Only match wildcard in leftmost segment.
-        raise CertificateError(
-            "wildcard can only be present in the leftmost label: "
-            "{!r}.".format(dn))
-
-    if not sep:
-        # no right side
-        raise CertificateError(
-            "sole wildcard without additional labels are not support: "
-            "{!r}.".format(dn))
-
-    if dn_leftmost != '*':
-        # no partial wildcard matching
-        raise CertificateError(
-            "partial wildcards in leftmost label are not supported: "
-            "{!r}.".format(dn))
-
-    hostname_leftmost, sep, hostname_remainder = hostname.partition('.')
-    if not hostname_leftmost or not sep:
-        # wildcard must match at least one char
-        return False
-    return dn_remainder.lower() == hostname_remainder.lower()
-
-
-def _inet_paton(ipname):
-    """Try to convert an IP address to packed binary form
-
-    Supports IPv4 addresses on all platforms and IPv6 on platforms with IPv6
-    support.
-    """
-    # inet_aton() also accepts strings like '1', '127.1', some also trailing
-    # data like '127.0.0.1 whatever'.
-    try:
-        addr = _socket.inet_aton(ipname)
-    except OSError:
-        # not an IPv4 address
-        pass
-    else:
-        if _socket.inet_ntoa(addr) == ipname:
-            # only accept injective ipnames
-            return addr
-        else:
-            # refuse for short IPv4 notation and additional trailing data
-            raise ValueError(
-                "{!r} is not a quad-dotted IPv4 address.".format(ipname)
-            )
-
-    try:
-        return _socket.inet_pton(_socket.AF_INET6, ipname)
-    except OSError:
-        raise ValueError("{!r} is neither an IPv4 nor an IP6 "
-                         "address.".format(ipname))
-    except AttributeError:
-        # AF_INET6 not available
-        pass
-
-    raise ValueError("{!r} is not an IPv4 address.".format(ipname))
-
-
-def _ipaddress_match(cert_ipaddress, host_ip):
-    """Exact matching of IP addresses.
-
-    RFC 6125 explicitly doesn't define an algorithm for this
-    (section 1.7.2 - "Out of Scope").
-    """
-    # OpenSSL may add a trailing newline to a subjectAltName's IP address,
-    # commonly woth IPv6 addresses. Strip off trailing \n.
-    ip = _inet_paton(cert_ipaddress.rstrip())
-    return ip == host_ip
-
-
-def match_hostname(cert, hostname):
-    """Verify that *cert* (in decoded format as returned by
-    SSLSocket.getpeercert()) matches the *hostname*.  RFC 2818 and RFC 6125
-    rules are followed.
-
-    The function matches IP addresses rather than dNSNames if hostname is a
-    valid ipaddress string. IPv4 addresses are supported on all platforms.
-    IPv6 addresses are supported on platforms with IPv6 support (AF_INET6
-    and inet_pton).
-
-    CertificateError is raised on failure. On success, the function
-    returns nothing.
-    """
-    if not cert:
-        raise ValueError("empty or no certificate, match_hostname needs a "
-                         "SSL socket or SSL context with either "
-                         "CERT_OPTIONAL or CERT_REQUIRED")
-    try:
-        host_ip = _inet_paton(hostname)
-    except ValueError:
-        # Not an IP address (common case)
-        host_ip = None
-    dnsnames = []
-    san = cert.get('subjectAltName', ())
-    for key, value in san:
-        if key == 'DNS':
-            if host_ip is None and _dnsname_match(value, hostname):
-                return
-            dnsnames.append(value)
-        elif key == 'IP Address':
-            if host_ip is not None and _ipaddress_match(value, host_ip):
-                return
-            dnsnames.append(value)
-    if not dnsnames:
-        # The subject is only checked when there is no dNSName entry
-        # in subjectAltName
-        for sub in cert.get('subject', ()):
-            for key, value in sub:
-                # XXX according to RFC 2818, the most specific Common Name
-                # must be used.
-                if key == 'commonName':
-                    if _dnsname_match(value, hostname):
-                        return
-                    dnsnames.append(value)
-    if len(dnsnames) > 1:
-        raise CertificateError("hostname %r "
-            "doesn't match either of %s"
-            % (hostname, ', '.join(map(repr, dnsnames))))
-    elif len(dnsnames) == 1:
-        raise CertificateError("hostname %r "
-            "doesn't match %r"
-            % (hostname, dnsnames[0]))
-    else:
-        raise CertificateError("no appropriate commonName or "
-            "subjectAltName fields were found")
-
-
-DefaultVerifyPaths = namedtuple("DefaultVerifyPaths",
-    "cafile capath openssl_cafile_env openssl_cafile openssl_capath_env "
-    "openssl_capath")
-
-def get_default_verify_paths():
-    """Return paths to default cafile and capath.
-    """
-    parts = _ssl.get_default_verify_paths()
-
-    # environment vars shadow paths
-    cafile = os.environ.get(parts[0], parts[1])
-    capath = os.environ.get(parts[2], parts[3])
-
-    return DefaultVerifyPaths(cafile if os.path.isfile(cafile) else None,
-                              capath if os.path.isdir(capath) else None,
-                              *parts)
-
-
-class _ASN1Object(namedtuple("_ASN1Object", "nid shortname longname oid")):
-    """ASN.1 object identifier lookup
-    """
-    __slots__ = ()
-
-    def __new__(cls, oid):
-        return super().__new__(cls, *_txt2obj(oid, name=False))
-
-    @classmethod
-    def fromnid(cls, nid):
-        """Create _ASN1Object from OpenSSL numeric ID
-        """
-        return super().__new__(cls, *_nid2obj(nid))
-
-    @classmethod
-    def fromname(cls, name):
-        """Create _ASN1Object from short name, long name or OID
-        """
-        return super().__new__(cls, *_txt2obj(name, name=True))
-
-
-class Purpose(_ASN1Object, _Enum):
-    """SSLContext purpose flags with X509v3 Extended Key Usage objects
-    """
-    SERVER_AUTH = '1.3.6.1.5.5.7.3.1'
-    CLIENT_AUTH = '1.3.6.1.5.5.7.3.2'
-
-
-class SSLContext(_SSLContext):
-    """An SSLContext holds various SSL-related configuration options and
-    data, such as certificates and possibly a private key."""
-    _windows_cert_stores = ("CA", "ROOT")
-
-    sslsocket_class = None  # SSLSocket is assigned later.
-    sslobject_class = None  # SSLObject is assigned later.
-
-    def __new__(cls, protocol=PROTOCOL_TLS, *args, **kwargs):
-        self = _SSLContext.__new__(cls, protocol)
-        return self
-
-    def _encode_hostname(self, hostname):
-        if hostname is None:
-            return None
-        elif isinstance(hostname, str):
-            return hostname.encode('idna').decode('ascii')
-        else:
-            return hostname.decode('ascii')
-
-    def wrap_socket(self, sock, server_side=False,
-                    do_handshake_on_connect=True,
-                    suppress_ragged_eofs=True,
-                    server_hostname=None, session=None):
-        # SSLSocket class handles server_hostname encoding before it calls
-        # ctx._wrap_socket()
-        return self.sslsocket_class._create(
-            sock=sock,
-            server_side=server_side,
-            do_handshake_on_connect=do_handshake_on_connect,
-            suppress_ragged_eofs=suppress_ragged_eofs,
-            server_hostname=server_hostname,
-            context=self,
-            session=session
-        )
-
-    def wrap_bio(self, incoming, outgoing, server_side=False,
-                 server_hostname=None, session=None):
-        # Need to encode server_hostname here because _wrap_bio() can only
-        # handle ASCII str.
-        return self.sslobject_class._create(
-            incoming, outgoing, server_side=server_side,
-            server_hostname=self._encode_hostname(server_hostname),
-            session=session, context=self,
-        )
-
-    def set_npn_protocols(self, npn_protocols):
-        protos = bytearray()
-        for protocol in npn_protocols:
-            b = bytes(protocol, 'ascii')
-            if len(b) == 0 or len(b) > 255:
-                raise SSLError('NPN protocols must be 1 to 255 in length')
-            protos.append(len(b))
-            protos.extend(b)
-
-        self._set_npn_protocols(protos)
-
-    def set_servername_callback(self, server_name_callback):
-        if server_name_callback is None:
-            self.sni_callback = None
-        else:
-            if not callable(server_name_callback):
-                raise TypeError("not a callable object")
-
-            def shim_cb(sslobj, servername, sslctx):
-                servername = self._encode_hostname(servername)
-                return server_name_callback(sslobj, servername, sslctx)
-
-            self.sni_callback = shim_cb
-
-    def set_alpn_protocols(self, alpn_protocols):
-        protos = bytearray()
-        for protocol in alpn_protocols:
-            b = bytes(protocol, 'ascii')
-            if len(b) == 0 or len(b) > 255:
-                raise SSLError('ALPN protocols must be 1 to 255 in length')
-            protos.append(len(b))
-            protos.extend(b)
-
-        self._set_alpn_protocols(protos)
-
-    def _load_windows_store_certs(self, storename, purpose):
-        certs = bytearray()
         try:
-            for cert, encoding, trust in enum_certificates(storename):
-                # CA certs are never PKCS#7 encoded
-                if encoding == "x509_asn":
-                    if trust is True or purpose.oid in trust:
-                        certs.extend(cert)
-        except PermissionError:
-            warnings.warn("unable to enumerate Windows certificate store")
-        if certs:
-            self.load_verify_locations(cadata=certs)
-        return certs
-
-    def load_default_certs(self, purpose=Purpose.SERVER_AUTH):
-        if not isinstance(purpose, _ASN1Object):
-            raise TypeError(purpose)
-        if sys.platform == "win32":
-            for storename in self._windows_cert_stores:
-                self._load_windows_store_certs(storename, purpose)
-        self.set_default_verify_paths()
-
-    if hasattr(_SSLContext, 'minimum_version'):
-        @property
-        def minimum_version(self):
-            return TLSVersion(super().minimum_version)
-
-        @minimum_version.setter
-        def minimum_version(self, value):
-            if value == TLSVersion.SSLv3:
-                self.options &= ~Options.OP_NO_SSLv3
-            super(SSLContext, SSLContext).minimum_version.__set__(self, value)
-
-        @property
-        def maximum_version(self):
-            return TLSVersion(super().maximum_version)
-
-        @maximum_version.setter
-        def maximum_version(self, value):
-            super(SSLContext, SSLContext).maximum_version.__set__(self, value)
-
-    @property
-    def options(self):
-        return Options(super().options)
-
-    @options.setter
-    def options(self, value):
-        super(SSLContext, SSLContext).options.__set__(self, value)
-
-    if hasattr(_ssl, 'HOSTFLAG_NEVER_CHECK_SUBJECT'):
-        @property
-        def hostname_checks_common_name(self):
-            ncs = self._host_flags & _ssl.HOSTFLAG_NEVER_CHECK_SUBJECT
-            return ncs != _ssl.HOSTFLAG_NEVER_CHECK_SUBJECT
-
-        @hostname_checks_common_name.setter
-        def hostname_checks_common_name(self, value):
-            if value:
-                self._host_flags &= ~_ssl.HOSTFLAG_NEVER_CHECK_SUBJECT
-            else:
-                self._host_flags |= _ssl.HOSTFLAG_NEVER_CHECK_SUBJECT
-    else:
-        @property
-        def hostname_checks_common_name(self):
-            return True
-
-    @property
-    def _msg_callback(self):
-        """TLS message callback
-
-        The message callback provides a debugging hook to analyze TLS
-        connections. The callback is called for any TLS protocol message
-        (header, handshake, alert, and more), but not for application data.
-        Due to technical  limitations, the callback can't be used to filter
-        traffic or to abort a connection. Any exception raised in the
-        callback is delayed until the handshake, read, or write operation
-        has been performed.
-
-        def msg_cb(conn, direction, version, content_type, msg_type, data):
-            pass
-
-        conn
-            :class:`SSLSocket` or :class:`SSLObject` instance
-        direction
-            ``read`` or ``write``
-        version
-            :class:`TLSVersion` enum member or int for unknown version. For a
-            frame header, it's the header version.
-        content_type
-            :class:`_TLSContentType` enum member or int for unsupported
-            content type.
-        msg_type
-            Either a :class:`_TLSContentType` enum number for a header
-            message, a :class:`_TLSAlertType` enum member for an alert
-            message, a :class:`_TLSMessageType` enum member for other
-            messages, or int for unsupported message types.
-        data
-            Raw, decrypted message content as bytes
-        """
-        inner = super()._msg_callback
-        if inner is not None:
-            return inner.user_function
-        else:
-            return None
-
-    @_msg_callback.setter
-    def _msg_callback(self, callback):
-        if callback is None:
-            super(SSLContext, SSLContext)._msg_callback.__set__(self, None)
-            return
-
-        if not hasattr(callback, '__call__'):
-            raise TypeError(f"{callback} is not callable.")
-
-        def inner(conn, direction, version, content_type, msg_type, data):
-            try:
-                version = TLSVersion(version)
-            except ValueError:
-                pass
-
-            try:
-                content_type = _TLSContentType(content_type)
-            except ValueError:
-                pass
-
-            if content_type == _TLSContentType.HEADER:
-                msg_enum = _TLSContentType
-            elif content_type == _TLSContentType.ALERT:
-                msg_enum = _TLSAlertType
-            else:
-                msg_enum = _TLSMessageType
-            try:
-                msg_type = msg_enum(msg_type)
-            except ValueError:
-                pass
-
-            return callback(conn, direction, version,
-                            content_type, msg_type, data)
-
-        inner.user_function = callback
-
-        super(SSLContext, SSLContext)._msg_callback.__set__(self, inner)
-
-    @property
-    def protocol(self):
-        return _SSLMethod(super().protocol)
-
-    @property
-    def verify_flags(self):
-        return VerifyFlags(super().verify_flags)
-
-    @verify_flags.setter
-    def verify_flags(self, value):
-        super(SSLContext, SSLContext).verify_flags.__set__(self, value)
-
-    @property
-    def verify_mode(self):
-        value = super().verify_mode
-        try:
-            return VerifyMode(value)
-        except ValueError:
-            return value
-
-    @verify_mode.setter
-    def verify_mode(self, value):
-        super(SSLContext, SSLContext).verify_mode.__set__(self, value)
-
-
-def create_default_context(purpose=Purpose.SERVER_AUTH, *, cafile=None,
-                           capath=None, cadata=None):
-    """Create a SSLContext object with default settings.
-
-    NOTE: The protocol and settings may change anytime without prior
-          deprecation. The values represent a fair balance between maximum
-          compatibility and security.
-    """
-    if not isinstance(purpose, _ASN1Object):
-        raise TypeError(purpose)
-
-    # SSLContext sets OP_NO_SSLv2, OP_NO_SSLv3, OP_NO_COMPRESSION,
-    # OP_CIPHER_SERVER_PREFERENCE, OP_SINGLE_DH_USE and OP_SINGLE_ECDH_USE
-    # by default.
-    context = SSLContext(PROTOCOL_TLS)
-
-    if purpose == Purpose.SERVER_AUTH:
-        # verify certs and host name in client mode
-        context.verify_mode = CERT_REQUIRED
-        context.check_hostname = True
-
-    if cafile or capath or cadata:
-        context.load_verify_locations(cafile, capath, cadata)
-    elif context.verify_mode != CERT_NONE:
-        # no explicit cafile, capath or cadata but the verify mode is
-        # CERT_OPTIONAL or CERT_REQUIRED. Let's try to load default system
-        # root CA certificates for the given purpose. This may fail silently.
-        context.load_default_certs(purpose)
-    # OpenSSL 1.1.1 keylog file
-    if hasattr(context, 'keylog_filename'):
-        keylogfile = os.environ.get('SSLKEYLOGFILE')
-        if keylogfile and not sys.flags.ignore_environment:
-            context.keylog_filename = keylogfile
-    return context
-
-def _create_unverified_context(protocol=PROTOCOL_TLS, *, cert_reqs=CERT_NONE,
-                           check_hostname=False, purpose=Purpose.SERVER_AUTH,
-                           certfile=None, keyfile=None,
-                           cafile=None, capath=None, cadata=None):
-    """Create a SSLContext object for Python stdlib modules
-
-    All Python stdlib modules shall use this function to create SSLContext
-    objects in order to keep common settings in one place. The configuration
-    is less restrict than create_default_context()'s to increase backward
-    compatibility.
-    """
-    if not isinstance(purpose, _ASN1Object):
-        raise TypeError(purpose)
-
-    # SSLContext sets OP_NO_SSLv2, OP_NO_SSLv3, OP_NO_COMPRESSION,
-    # OP_CIPHER_SERVER_PREFERENCE, OP_SINGLE_DH_USE and OP_SINGLE_ECDH_USE
-    # by default.
-    context = SSLContext(protocol)
-
-    if not check_hostname:
-        context.check_hostname = False
-    if cert_reqs is not None:
-        context.verify_mode = cert_reqs
-    if check_hostname:
-        context.check_hostname = True
-
-    if keyfile and not certfile:
-        raise ValueError("certfile must be specified")
-    if certfile or keyfile:
-        context.load_cert_chain(certfile, keyfile)
-
-    # load CA root certs
-    if cafile or capath or cadata:
-        context.load_verify_locations(cafile, capath, cadata)
-    elif context.verify_mode != CERT_NONE:
-        # no explicit cafile, capath or cadata but the verify mode is
-        # CERT_OPTIONAL or CERT_REQUIRED. Let's try to load default system
-        # root CA certificates for the given purpose. This may fail silently.
-        context.load_default_certs(purpose)
-    # OpenSSL 1.1.1 keylog file
-    if hasattr(context, 'keylog_filename'):
-        keylogfile = os.environ.get('SSLKEYLOGFILE')
-        if keylogfile and not sys.flags.ignore_environment:
-            context.keylog_filename = keylogfile
-    return context
-
-# Used by http.client if no context is explicitly passed.
-_create_default_https_context = create_default_context
-
-
-# Backwards compatibility alias, even though it's not a public name.
-_create_stdlib_context = _create_unverified_context
-
-
-class SSLObject:
-    """This class implements an interface on top of a low-level SSL object as
-    implemented by OpenSSL. This object captures the state of an SSL connection
-    but does not provide any network IO itself. IO needs to be performed
-    through separate "BIO" objects which are OpenSSL's IO abstraction layer.
-
-    This class does not have a public constructor. Instances are returned by
-    ``SSLContext.wrap_bio``. This class is typically used by framework authors
-    that want to implement asynchronous IO for SSL through memory buffers.
-
-    When compared to ``SSLSocket``, this object lacks the following features:
-
-     * Any form of network IO, including methods such as ``recv`` and ``send``.
-     * The ``do_handshake_on_connect`` and ``suppress_ragged_eofs`` machinery.
-    """
-    def __init__(self, *args, **kwargs):
-        raise TypeError(
-            f"{self.__class__.__name__} does not have a public "
-            f"constructor. Instances are returned by SSLContext.wrap_bio()."
-        )
-
-    @classmethod
-    def _create(cls, incoming, outgoing, server_side=False,
-                 server_hostname=None, session=None, context=None):
-        self = cls.__new__(cls)
-        sslobj = context._wrap_bio(
-            incoming, outgoing, server_side=server_side,
-            server_hostname=server_hostname,
-            owner=self, session=session
-        )
-        self._sslobj = sslobj
-        return self
-
-    @property
-    def context(self):
-        """The SSLContext that is currently in use."""
-        return self._sslobj.context
-
-    @context.setter
-    def context(self, ctx):
-        self._sslobj.context = ctx
-
-    @property
-    def session(self):
-        """The SSLSession for client socket."""
-        return self._sslobj.session
-
-    @session.setter
-    def session(self, session):
-        self._sslobj.session = session
-
-    @property
-    def session_reused(self):
-        """Was the client session reused during handshake"""
-        return self._sslobj.session_reused
-
-    @property
-    def server_side(self):
-        """Whether this is a server-side socket."""
-        return self._sslobj.server_side
-
-    @property
-    def server_hostname(self):
-        """The currently set server hostname (for SNI), or ``None`` if no
-        server hostname is set."""
-        return self._sslobj.server_hostname
-
-    def read(self, len=1024, buffer=None):
-        """Read up to 'len' bytes from the SSL object and return them.
-
-        If 'buffer' is provided, read into this buffer and return the number of
-        bytes read.
-        """
-        if buffer is not None:
-            v = self._sslobj.read(len, buffer)
-        else:
-            v = self._sslobj.read(len)
-        return v
-
-    def write(self, data):
-        """Write 'data' to the SSL object and return the number of bytes
-        written.
-
-        The 'data' argument must support the buffer interface.
-        """
-        return self._sslobj.write(data)
-
-    def getpeercert(self, binary_form=False):
-        """Returns a formatted version of the data in the certificate provided
-        by the other end of the SSL channel.
-
-        Return None if no certificate was provided, {} if a certificate was
-        provided, but not validated.
-        """
-        return self._sslobj.getpeercert(binary_form)
-
-    def selected_npn_protocol(self):
-        """Return the currently selected NPN protocol as a string, or ``None``
-        if a next protocol was not negotiated or if NPN is not supported by one
-        of the peers."""
-        if _ssl.HAS_NPN:
-            return self._sslobj.selected_npn_protocol()
-
-    def selected_alpn_protocol(self):
-        """Return the currently selected ALPN protocol as a string, or ``None``
-        if a next protocol was not negotiated or if ALPN is not supported by one
-        of the peers."""
-        if _ssl.HAS_ALPN:
-            return self._sslobj.selected_alpn_protocol()
-
-    def cipher(self):
-        """Return the currently selected cipher as a 3-tuple ``(name,
-        ssl_version, secret_bits)``."""
-        return self._sslobj.cipher()
-
-    def shared_ciphers(self):
-        """Return a list of ciphers shared by the client during the handshake or
-        None if this is not a valid server connection.
-        """
-        return self._sslobj.shared_ciphers()
-
-    def compression(self):
-        """Return the current compression algorithm in use, or ``None`` if
-        compression was not negotiated or not supported by one of the peers."""
-        return self._sslobj.compression()
-
-    def pending(self):
-        """Return the number of bytes that can be read immediately."""
-        return self._sslobj.pending()
-
-    def do_handshake(self):
-        """Start the SSL/TLS handshake."""
-        self._sslobj.do_handshake()
-
-    def unwrap(self):
-        """Start the SSL shutdown handshake."""
-        return self._sslobj.shutdown()
-
-    def get_channel_binding(self, cb_type="tls-unique"):
-        """Get channel binding data for current connection.  Raise ValueError
-        if the requested `cb_type` is not supported.  Return bytes of the data
-        or None if the data is not available (e.g. before the handshake)."""
-        return self._sslobj.get_channel_binding(cb_type)
-
-    def version(self):
-        """Return a string identifying the protocol version used by the
-        current SSL channel. """
-        return self._sslobj.version()
-
-    def verify_client_post_handshake(self):
-        return self._sslobj.verify_client_post_handshake()
-
-
-def _sslcopydoc(func):
-    """Copy docstring from SSLObject to SSLSocket"""
-    func.__doc__ = getattr(SSLObject, func.__name__).__doc__
-    return func
-
-
-class SSLSocket(socket):
-    """This class implements a subtype of socket.socket that wraps
-    the underlying OS socket in an SSL context when necessary, and
-    provides read and write methods over that channel. """
-
-    def __init__(self, *args, **kwargs):
-        raise TypeError(
-            f"{self.__class__.__name__} does not have a public "
-            f"constructor. Instances are returned by "
-            f"SSLContext.wrap_socket()."
-        )
-
-    @classmethod
-    def _create(cls, sock, server_side=False, do_handshake_on_connect=True,
-                suppress_ragged_eofs=True, server_hostname=None,
-                context=None, session=None):
-        if sock.getsockopt(SOL_SOCKET, SO_TYPE) != SOCK_STREAM:
-            raise NotImplementedError("only stream sockets are supported")
-        if server_side:
-            if server_hostname:
-                raise ValueError("server_hostname can only be specified "
-                                 "in client mode")
-            if session is not None:
-                raise ValueError("session can only be specified in "
-                                 "client mode")
-        if context.check_hostname and not server_hostname:
-            raise ValueError("check_hostname requires server_hostname")
-
-        kwargs = dict(
-            family=sock.family, type=sock.type, proto=sock.proto,
-            fileno=sock.fileno()
-        )
-        self = cls.__new__(cls, **kwargs)
-        super(SSLSocket, self).__init__(**kwargs)
-        self.settimeout(sock.gettimeout())
-        sock.detach()
+            method_func = self._methods[method]
+        except KeyError:
+            raise ValueError("No such protocol")
+
+        method_obj = method_func()
+        _openssl_assert(method_obj != _ffi.NULL)
+
+        context = _lib.SSL_CTX_new(method_obj)
+        _openssl_assert(context != _ffi.NULL)
+        context = _ffi.gc(context, _lib.SSL_CTX_free)
+
+        # Set SSL_CTX_set_ecdh_auto so that the ECDH curve will be
+        # auto-selected. This function was added in 1.0.2 and made a noop in
+        # 1.1.0+ (where it is set automatically).
+        res = _lib.SSL_CTX_set_ecdh_auto(context, 1)
+        _openssl_assert(res == 1)
 
         self._context = context
-        self._session = session
-        self._closed = False
-        self._sslobj = None
-        self.server_side = server_side
-        self.server_hostname = context._encode_hostname(server_hostname)
-        self.do_handshake_on_connect = do_handshake_on_connect
-        self.suppress_ragged_eofs = suppress_ragged_eofs
+        self._passphrase_helper = None
+        self._passphrase_callback = None
+        self._passphrase_userdata = None
+        self._verify_helper = None
+        self._verify_callback = None
+        self._info_callback = None
+        self._keylog_callback = None
+        self._tlsext_servername_callback = None
+        self._app_data = None
+        self._alpn_select_helper = None
+        self._alpn_select_callback = None
+        self._ocsp_helper = None
+        self._ocsp_callback = None
+        self._ocsp_data = None
 
-        # See if we are connected
-        try:
-            self.getpeername()
-        except OSError as e:
-            if e.errno != errno.ENOTCONN:
-                raise
-            connected = False
-        else:
-            connected = True
+        self.set_mode(_lib.SSL_MODE_ENABLE_PARTIAL_WRITE)
 
-        self._connected = connected
-        if connected:
-            # create the SSL object
-            try:
-                self._sslobj = self._context._wrap_socket(
-                    self, server_side, self.server_hostname,
-                    owner=self, session=self._session,
-                )
-                if do_handshake_on_connect:
-                    timeout = self.gettimeout()
-                    if timeout == 0.0:
-                        # non-blocking
-                        raise ValueError("do_handshake_on_connect should not be specified for non-blocking sockets")
-                    self.do_handshake()
-            except (OSError, ValueError):
-                self.close()
-                raise
-        return self
-
-    @property
-    @_sslcopydoc
-    def context(self):
-        return self._context
-
-    @context.setter
-    def context(self, ctx):
-        self._context = ctx
-        self._sslobj.context = ctx
-
-    @property
-    @_sslcopydoc
-    def session(self):
-        if self._sslobj is not None:
-            return self._sslobj.session
-
-    @session.setter
-    def session(self, session):
-        self._session = session
-        if self._sslobj is not None:
-            self._sslobj.session = session
-
-    @property
-    @_sslcopydoc
-    def session_reused(self):
-        if self._sslobj is not None:
-            return self._sslobj.session_reused
-
-    def dup(self):
-        raise NotImplementedError("Can't dup() %s instances" %
-                                  self.__class__.__name__)
-
-    def _checkClosed(self, msg=None):
-        # raise an exception here if you wish to check for spurious closes
-        pass
-
-    def _check_connected(self):
-        if not self._connected:
-            # getpeername() will raise ENOTCONN if the socket is really
-            # not connected; note that we can be connected even without
-            # _connected being set, e.g. if connect() first returned
-            # EAGAIN.
-            self.getpeername()
-
-    def read(self, len=1024, buffer=None):
-        """Read up to LEN bytes and return them.
-        Return zero-length string on EOF."""
-
-        self._checkClosed()
-        if self._sslobj is None:
-            raise ValueError("Read on closed or unwrapped SSL socket.")
-        try:
-            if buffer is not None:
-                return self._sslobj.read(len, buffer)
-            else:
-                return self._sslobj.read(len)
-        except SSLError as x:
-            if x.args[0] == SSL_ERROR_EOF and self.suppress_ragged_eofs:
-                if buffer is not None:
-                    return 0
-                else:
-                    return b''
-            else:
-                raise
-
-    def write(self, data):
-        """Write DATA to the underlying SSL channel.  Returns
-        number of bytes of DATA actually transmitted."""
-
-        self._checkClosed()
-        if self._sslobj is None:
-            raise ValueError("Write on closed or unwrapped SSL socket.")
-        return self._sslobj.write(data)
-
-    @_sslcopydoc
-    def getpeercert(self, binary_form=False):
-        self._checkClosed()
-        self._check_connected()
-        return self._sslobj.getpeercert(binary_form)
-
-    @_sslcopydoc
-    def selected_npn_protocol(self):
-        self._checkClosed()
-        if self._sslobj is None or not _ssl.HAS_NPN:
-            return None
-        else:
-            return self._sslobj.selected_npn_protocol()
-
-    @_sslcopydoc
-    def selected_alpn_protocol(self):
-        self._checkClosed()
-        if self._sslobj is None or not _ssl.HAS_ALPN:
-            return None
-        else:
-            return self._sslobj.selected_alpn_protocol()
-
-    @_sslcopydoc
-    def cipher(self):
-        self._checkClosed()
-        if self._sslobj is None:
-            return None
-        else:
-            return self._sslobj.cipher()
-
-    @_sslcopydoc
-    def shared_ciphers(self):
-        self._checkClosed()
-        if self._sslobj is None:
-            return None
-        else:
-            return self._sslobj.shared_ciphers()
-
-    @_sslcopydoc
-    def compression(self):
-        self._checkClosed()
-        if self._sslobj is None:
-            return None
-        else:
-            return self._sslobj.compression()
-
-    def send(self, data, flags=0):
-        self._checkClosed()
-        if self._sslobj is not None:
-            if flags != 0:
-                raise ValueError(
-                    "non-zero flags not allowed in calls to send() on %s" %
-                    self.__class__)
-            return self._sslobj.write(data)
-        else:
-            return super().send(data, flags)
-
-    def sendto(self, data, flags_or_addr, addr=None):
-        self._checkClosed()
-        if self._sslobj is not None:
-            raise ValueError("sendto not allowed on instances of %s" %
-                             self.__class__)
-        elif addr is None:
-            return super().sendto(data, flags_or_addr)
-        else:
-            return super().sendto(data, flags_or_addr, addr)
-
-    def sendmsg(self, *args, **kwargs):
-        # Ensure programs don't send data unencrypted if they try to
-        # use this method.
-        raise NotImplementedError("sendmsg not allowed on instances of %s" %
-                                  self.__class__)
-
-    def sendall(self, data, flags=0):
-        self._checkClosed()
-        if self._sslobj is not None:
-            if flags != 0:
-                raise ValueError(
-                    "non-zero flags not allowed in calls to sendall() on %s" %
-                    self.__class__)
-            count = 0
-            with memoryview(data) as view, view.cast("B") as byte_view:
-                amount = len(byte_view)
-                while count < amount:
-                    v = self.send(byte_view[count:])
-                    count += v
-        else:
-            return super().sendall(data, flags)
-
-    def sendfile(self, file, offset=0, count=None):
-        """Send a file, possibly by using os.sendfile() if this is a
-        clear-text socket.  Return the total number of bytes sent.
+    def load_verify_locations(self, cafile, capath=None):
         """
-        if self._sslobj is not None:
-            return self._sendfile_use_send(file, offset, count)
+        Let SSL know where we can find trusted certificates for the certificate
+        chain.  Note that the certificates have to be in PEM format.
+
+        If capath is passed, it must be a directory prepared using the
+        ``c_rehash`` tool included with OpenSSL.  Either, but not both, of
+        *pemfile* or *capath* may be :data:`None`.
+
+        :param cafile: In which file we can find the certificates (``bytes`` or
+            ``unicode``).
+        :param capath: In which directory we can find the certificates
+            (``bytes`` or ``unicode``).
+
+        :return: None
+        """
+        if cafile is None:
+            cafile = _ffi.NULL
         else:
-            # os.sendfile() works with plain sockets only
-            return super().sendfile(file, offset, count)
+            cafile = _path_string(cafile)
 
-    def recv(self, buflen=1024, flags=0):
-        self._checkClosed()
-        if self._sslobj is not None:
-            if flags != 0:
-                raise ValueError(
-                    "non-zero flags not allowed in calls to recv() on %s" %
-                    self.__class__)
-            return self.read(buflen)
+        if capath is None:
+            capath = _ffi.NULL
         else:
-            return super().recv(buflen, flags)
+            capath = _path_string(capath)
 
-    def recv_into(self, buffer, nbytes=None, flags=0):
-        self._checkClosed()
-        if buffer and (nbytes is None):
-            nbytes = len(buffer)
-        elif nbytes is None:
-            nbytes = 1024
-        if self._sslobj is not None:
-            if flags != 0:
-                raise ValueError(
-                  "non-zero flags not allowed in calls to recv_into() on %s" %
-                  self.__class__)
-            return self.read(nbytes, buffer)
-        else:
-            return super().recv_into(buffer, nbytes, flags)
-
-    def recvfrom(self, buflen=1024, flags=0):
-        self._checkClosed()
-        if self._sslobj is not None:
-            raise ValueError("recvfrom not allowed on instances of %s" %
-                             self.__class__)
-        else:
-            return super().recvfrom(buflen, flags)
-
-    def recvfrom_into(self, buffer, nbytes=None, flags=0):
-        self._checkClosed()
-        if self._sslobj is not None:
-            raise ValueError("recvfrom_into not allowed on instances of %s" %
-                             self.__class__)
-        else:
-            return super().recvfrom_into(buffer, nbytes, flags)
-
-    def recvmsg(self, *args, **kwargs):
-        raise NotImplementedError("recvmsg not allowed on instances of %s" %
-                                  self.__class__)
-
-    def recvmsg_into(self, *args, **kwargs):
-        raise NotImplementedError("recvmsg_into not allowed on instances of "
-                                  "%s" % self.__class__)
-
-    @_sslcopydoc
-    def pending(self):
-        self._checkClosed()
-        if self._sslobj is not None:
-            return self._sslobj.pending()
-        else:
-            return 0
-
-    def shutdown(self, how):
-        self._checkClosed()
-        self._sslobj = None
-        super().shutdown(how)
-
-    @_sslcopydoc
-    def unwrap(self):
-        if self._sslobj:
-            s = self._sslobj.shutdown()
-            self._sslobj = None
-            return s
-        else:
-            raise ValueError("No SSL wrapper around " + str(self))
-
-    @_sslcopydoc
-    def verify_client_post_handshake(self):
-        if self._sslobj:
-            return self._sslobj.verify_client_post_handshake()
-        else:
-            raise ValueError("No SSL wrapper around " + str(self))
-
-    def _real_close(self):
-        self._sslobj = None
-        super()._real_close()
-
-    @_sslcopydoc
-    def do_handshake(self, block=False):
-        self._check_connected()
-        timeout = self.gettimeout()
-        try:
-            if timeout == 0.0 and block:
-                self.settimeout(None)
-            self._sslobj.do_handshake()
-        finally:
-            self.settimeout(timeout)
-
-    def _real_connect(self, addr, connect_ex):
-        if self.server_side:
-            raise ValueError("can't connect in server-side mode")
-        # Here we assume that the socket is client-side, and not
-        # connected at the time of the call.  We connect it, then wrap it.
-        if self._connected or self._sslobj is not None:
-            raise ValueError("attempt to connect already-connected SSLSocket!")
-        self._sslobj = self.context._wrap_socket(
-            self, False, self.server_hostname,
-            owner=self, session=self._session
+        load_result = _lib.SSL_CTX_load_verify_locations(
+            self._context, cafile, capath
         )
+        if not load_result:
+            _raise_current_error()
+
+    def _wrap_callback(self, callback):
+        @wraps(callback)
+        def wrapper(size, verify, userdata):
+            return callback(size, verify, self._passphrase_userdata)
+
+        return _PassphraseHelper(
+            FILETYPE_PEM, wrapper, more_args=True, truncate=True
+        )
+
+    def set_passwd_cb(self, callback, userdata=None):
+        """
+        Set the passphrase callback.  This function will be called
+        when a private key with a passphrase is loaded.
+
+        :param callback: The Python callback to use.  This must accept three
+            positional arguments.  First, an integer giving the maximum length
+            of the passphrase it may return.  If the returned passphrase is
+            longer than this, it will be truncated.  Second, a boolean value
+            which will be true if the user should be prompted for the
+            passphrase twice and the callback should verify that the two values
+            supplied are equal. Third, the value given as the *userdata*
+            parameter to :meth:`set_passwd_cb`.  The *callback* must return
+            a byte string. If an error occurs, *callback* should return a false
+            value (e.g. an empty string).
+        :param userdata: (optional) A Python object which will be given as
+                         argument to the callback
+        :return: None
+        """
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+
+        self._passphrase_helper = self._wrap_callback(callback)
+        self._passphrase_callback = self._passphrase_helper.callback
+        _lib.SSL_CTX_set_default_passwd_cb(
+            self._context, self._passphrase_callback
+        )
+        self._passphrase_userdata = userdata
+
+    def set_default_verify_paths(self):
+        """
+        Specify that the platform provided CA certificates are to be used for
+        verification purposes. This method has some caveats related to the
+        binary wheels that cryptography (pyOpenSSL's primary dependency) ships:
+
+        *   macOS will only load certificates using this method if the user has
+            the ``openssl@1.1`` `Homebrew <https://brew.sh>`_ formula installed
+            in the default location.
+        *   Windows will not work.
+        *   manylinux1 cryptography wheels will work on most common Linux
+            distributions in pyOpenSSL 17.1.0 and above.  pyOpenSSL detects the
+            manylinux1 wheel and attempts to load roots via a fallback path.
+
+        :return: None
+        """
+        # SSL_CTX_set_default_verify_paths will attempt to load certs from
+        # both a cafile and capath that are set at compile time. However,
+        # it will first check environment variables and, if present, load
+        # those paths instead
+        set_result = _lib.SSL_CTX_set_default_verify_paths(self._context)
+        _openssl_assert(set_result == 1)
+        # After attempting to set default_verify_paths we need to know whether
+        # to go down the fallback path.
+        # First we'll check to see if any env vars have been set. If so,
+        # we won't try to do anything else because the user has set the path
+        # themselves.
+        dir_env_var = _ffi.string(_lib.X509_get_default_cert_dir_env()).decode(
+            "ascii"
+        )
+        file_env_var = _ffi.string(
+            _lib.X509_get_default_cert_file_env()
+        ).decode("ascii")
+        if not self._check_env_vars_set(dir_env_var, file_env_var):
+            default_dir = _ffi.string(_lib.X509_get_default_cert_dir())
+            default_file = _ffi.string(_lib.X509_get_default_cert_file())
+            # Now we check to see if the default_dir and default_file are set
+            # to the exact values we use in our manylinux1 builds. If they are
+            # then we know to load the fallbacks
+            if (
+                default_dir == _CRYPTOGRAPHY_MANYLINUX1_CA_DIR
+                and default_file == _CRYPTOGRAPHY_MANYLINUX1_CA_FILE
+            ):
+                # This is manylinux1, let's load our fallback paths
+                self._fallback_default_verify_paths(
+                    _CERTIFICATE_FILE_LOCATIONS, _CERTIFICATE_PATH_LOCATIONS
+                )
+
+    def _check_env_vars_set(self, dir_env_var, file_env_var):
+        """
+        Check to see if the default cert dir/file environment vars are present.
+
+        :return: bool
+        """
+        return (
+            os.environ.get(file_env_var) is not None
+            or os.environ.get(dir_env_var) is not None
+        )
+
+    def _fallback_default_verify_paths(self, file_path, dir_path):
+        """
+        Default verify paths are based on the compiled version of OpenSSL.
+        However, when pyca/cryptography is compiled as a manylinux1 wheel
+        that compiled location can potentially be wrong. So, like Go, we
+        will try a predefined set of paths and attempt to load roots
+        from there.
+
+        :return: None
+        """
+        for cafile in file_path:
+            if os.path.isfile(cafile):
+                self.load_verify_locations(cafile)
+                break
+
+        for capath in dir_path:
+            if os.path.isdir(capath):
+                self.load_verify_locations(None, capath)
+                break
+
+    def use_certificate_chain_file(self, certfile):
+        """
+        Load a certificate chain from a file.
+
+        :param certfile: The name of the certificate chain file (``bytes`` or
+            ``unicode``).  Must be PEM encoded.
+
+        :return: None
+        """
+        certfile = _path_string(certfile)
+
+        result = _lib.SSL_CTX_use_certificate_chain_file(
+            self._context, certfile
+        )
+        if not result:
+            _raise_current_error()
+
+    def use_certificate_file(self, certfile, filetype=FILETYPE_PEM):
+        """
+        Load a certificate from a file
+
+        :param certfile: The name of the certificate file (``bytes`` or
+            ``unicode``).
+        :param filetype: (optional) The encoding of the file, which is either
+            :const:`FILETYPE_PEM` or :const:`FILETYPE_ASN1`.  The default is
+            :const:`FILETYPE_PEM`.
+
+        :return: None
+        """
+        certfile = _path_string(certfile)
+        if not isinstance(filetype, integer_types):
+            raise TypeError("filetype must be an integer")
+
+        use_result = _lib.SSL_CTX_use_certificate_file(
+            self._context, certfile, filetype
+        )
+        if not use_result:
+            _raise_current_error()
+
+    def use_certificate(self, cert):
+        """
+        Load a certificate from a X509 object
+
+        :param cert: The X509 object
+        :return: None
+        """
+        if not isinstance(cert, X509):
+            raise TypeError("cert must be an X509 instance")
+
+        use_result = _lib.SSL_CTX_use_certificate(self._context, cert._x509)
+        if not use_result:
+            _raise_current_error()
+
+    def add_extra_chain_cert(self, certobj):
+        """
+        Add certificate to chain
+
+        :param certobj: The X509 certificate object to add to the chain
+        :return: None
+        """
+        if not isinstance(certobj, X509):
+            raise TypeError("certobj must be an X509 instance")
+
+        copy = _lib.X509_dup(certobj._x509)
+        add_result = _lib.SSL_CTX_add_extra_chain_cert(self._context, copy)
+        if not add_result:
+            # TODO: This is untested.
+            _lib.X509_free(copy)
+            _raise_current_error()
+
+    def _raise_passphrase_exception(self):
+        if self._passphrase_helper is not None:
+            self._passphrase_helper.raise_if_problem(Error)
+
+        _raise_current_error()
+
+    def use_privatekey_file(self, keyfile, filetype=_UNSPECIFIED):
+        """
+        Load a private key from a file
+
+        :param keyfile: The name of the key file (``bytes`` or ``unicode``)
+        :param filetype: (optional) The encoding of the file, which is either
+            :const:`FILETYPE_PEM` or :const:`FILETYPE_ASN1`.  The default is
+            :const:`FILETYPE_PEM`.
+
+        :return: None
+        """
+        keyfile = _path_string(keyfile)
+
+        if filetype is _UNSPECIFIED:
+            filetype = FILETYPE_PEM
+        elif not isinstance(filetype, integer_types):
+            raise TypeError("filetype must be an integer")
+
+        use_result = _lib.SSL_CTX_use_PrivateKey_file(
+            self._context, keyfile, filetype
+        )
+        if not use_result:
+            self._raise_passphrase_exception()
+
+    def use_privatekey(self, pkey):
+        """
+        Load a private key from a PKey object
+
+        :param pkey: The PKey object
+        :return: None
+        """
+        if not isinstance(pkey, PKey):
+            raise TypeError("pkey must be a PKey instance")
+
+        use_result = _lib.SSL_CTX_use_PrivateKey(self._context, pkey._pkey)
+        if not use_result:
+            self._raise_passphrase_exception()
+
+    def check_privatekey(self):
+        """
+        Check if the private key (loaded with :meth:`use_privatekey`) matches
+        the certificate (loaded with :meth:`use_certificate`)
+
+        :return: :data:`None` (raises :exc:`Error` if something's wrong)
+        """
+        if not _lib.SSL_CTX_check_private_key(self._context):
+            _raise_current_error()
+
+    def load_client_ca(self, cafile):
+        """
+        Load the trusted certificates that will be sent to the client.  Does
+        not actually imply any of the certificates are trusted; that must be
+        configured separately.
+
+        :param bytes cafile: The path to a certificates file in PEM format.
+        :return: None
+        """
+        ca_list = _lib.SSL_load_client_CA_file(
+            _text_to_bytes_and_warn("cafile", cafile)
+        )
+        _openssl_assert(ca_list != _ffi.NULL)
+        _lib.SSL_CTX_set_client_CA_list(self._context, ca_list)
+
+    def set_session_id(self, buf):
+        """
+        Set the session id to *buf* within which a session can be reused for
+        this Context object.  This is needed when doing session resumption,
+        because there is no way for a stored session to know which Context
+        object it is associated with.
+
+        :param bytes buf: The session id.
+
+        :returns: None
+        """
+        buf = _text_to_bytes_and_warn("buf", buf)
+        _openssl_assert(
+            _lib.SSL_CTX_set_session_id_context(self._context, buf, len(buf))
+            == 1
+        )
+
+    def set_session_cache_mode(self, mode):
+        """
+        Set the behavior of the session cache used by all connections using
+        this Context.  The previously set mode is returned.  See
+        :const:`SESS_CACHE_*` for details about particular modes.
+
+        :param mode: One or more of the SESS_CACHE_* flags (combine using
+            bitwise or)
+        :returns: The previously set caching mode.
+
+        .. versionadded:: 0.14
+        """
+        if not isinstance(mode, integer_types):
+            raise TypeError("mode must be an integer")
+
+        return _lib.SSL_CTX_set_session_cache_mode(self._context, mode)
+
+    def get_session_cache_mode(self):
+        """
+        Get the current session cache mode.
+
+        :returns: The currently used cache mode.
+
+        .. versionadded:: 0.14
+        """
+        return _lib.SSL_CTX_get_session_cache_mode(self._context)
+
+    def set_verify(self, mode, callback=None):
+        """
+        Set the verification flags for this Context object to *mode* and
+        specify that *callback* should be used for verification callbacks.
+
+        :param mode: The verify mode, this should be one of
+            :const:`VERIFY_NONE` and :const:`VERIFY_PEER`. If
+            :const:`VERIFY_PEER` is used, *mode* can be OR:ed with
+            :const:`VERIFY_FAIL_IF_NO_PEER_CERT` and
+            :const:`VERIFY_CLIENT_ONCE` to further control the behaviour.
+        :param callback: The optional Python verification callback to use.
+            This should take five arguments: A Connection object, an X509
+            object, and three integer variables, which are in turn potential
+            error number, error depth and return code. *callback* should
+            return True if verification passes and False otherwise.
+            If omitted, OpenSSL's default verification is used.
+        :return: None
+
+        See SSL_CTX_set_verify(3SSL) for further details.
+        """
+        if not isinstance(mode, integer_types):
+            raise TypeError("mode must be an integer")
+
+        if callback is None:
+            self._verify_helper = None
+            self._verify_callback = None
+            _lib.SSL_CTX_set_verify(self._context, mode, _ffi.NULL)
+        else:
+            if not callable(callback):
+                raise TypeError("callback must be callable")
+
+            self._verify_helper = _VerifyHelper(callback)
+            self._verify_callback = self._verify_helper.callback
+            _lib.SSL_CTX_set_verify(self._context, mode, self._verify_callback)
+
+    def set_verify_depth(self, depth):
+        """
+        Set the maximum depth for the certificate chain verification that shall
+        be allowed for this Context object.
+
+        :param depth: An integer specifying the verify depth
+        :return: None
+        """
+        if not isinstance(depth, integer_types):
+            raise TypeError("depth must be an integer")
+
+        _lib.SSL_CTX_set_verify_depth(self._context, depth)
+
+    def get_verify_mode(self):
+        """
+        Retrieve the Context object's verify mode, as set by
+        :meth:`set_verify`.
+
+        :return: The verify mode
+        """
+        return _lib.SSL_CTX_get_verify_mode(self._context)
+
+    def get_verify_depth(self):
+        """
+        Retrieve the Context object's verify depth, as set by
+        :meth:`set_verify_depth`.
+
+        :return: The verify depth
+        """
+        return _lib.SSL_CTX_get_verify_depth(self._context)
+
+    def load_tmp_dh(self, dhfile):
+        """
+        Load parameters for Ephemeral Diffie-Hellman
+
+        :param dhfile: The file to load EDH parameters from (``bytes`` or
+            ``unicode``).
+
+        :return: None
+        """
+        dhfile = _path_string(dhfile)
+
+        bio = _lib.BIO_new_file(dhfile, b"r")
+        if bio == _ffi.NULL:
+            _raise_current_error()
+        bio = _ffi.gc(bio, _lib.BIO_free)
+
+        dh = _lib.PEM_read_bio_DHparams(bio, _ffi.NULL, _ffi.NULL, _ffi.NULL)
+        dh = _ffi.gc(dh, _lib.DH_free)
+        res = _lib.SSL_CTX_set_tmp_dh(self._context, dh)
+        _openssl_assert(res == 1)
+
+    def set_tmp_ecdh(self, curve):
+        """
+        Select a curve to use for ECDHE key exchange.
+
+        :param curve: A curve object to use as returned by either
+            :meth:`OpenSSL.crypto.get_elliptic_curve` or
+            :meth:`OpenSSL.crypto.get_elliptic_curves`.
+
+        :return: None
+        """
+        _lib.SSL_CTX_set_tmp_ecdh(self._context, curve._to_EC_KEY())
+
+    def set_cipher_list(self, cipher_list):
+        """
+        Set the list of ciphers to be used in this context.
+
+        See the OpenSSL manual for more information (e.g.
+        :manpage:`ciphers(1)`).
+
+        :param bytes cipher_list: An OpenSSL cipher string.
+        :return: None
+        """
+        cipher_list = _text_to_bytes_and_warn("cipher_list", cipher_list)
+
+        if not isinstance(cipher_list, bytes):
+            raise TypeError("cipher_list must be a byte string.")
+
+        _openssl_assert(
+            _lib.SSL_CTX_set_cipher_list(self._context, cipher_list) == 1
+        )
+        # In OpenSSL 1.1.1 setting the cipher list will always return TLS 1.3
+        # ciphers even if you pass an invalid cipher. Applications (like
+        # Twisted) have tests that depend on an error being raised if an
+        # invalid cipher string is passed, but without the following check
+        # for the TLS 1.3 specific cipher suites it would never error.
+        tmpconn = Connection(self, None)
+        if tmpconn.get_cipher_list() == [
+            "TLS_AES_256_GCM_SHA384",
+            "TLS_CHACHA20_POLY1305_SHA256",
+            "TLS_AES_128_GCM_SHA256",
+        ]:
+            raise Error(
+                [
+                    (
+                        "SSL routines",
+                        "SSL_CTX_set_cipher_list",
+                        "no cipher match",
+                    ),
+                ],
+            )
+
+    def set_client_ca_list(self, certificate_authorities):
+        """
+        Set the list of preferred client certificate signers for this server
+        context.
+
+        This list of certificate authorities will be sent to the client when
+        the server requests a client certificate.
+
+        :param certificate_authorities: a sequence of X509Names.
+        :return: None
+
+        .. versionadded:: 0.10
+        """
+        name_stack = _lib.sk_X509_NAME_new_null()
+        _openssl_assert(name_stack != _ffi.NULL)
+
         try:
-            if connect_ex:
-                rc = super().connect_ex(addr)
-            else:
-                rc = None
-                super().connect(addr)
-            if not rc:
-                self._connected = True
-                if self.do_handshake_on_connect:
-                    self.do_handshake()
-            return rc
-        except (OSError, ValueError):
-            self._sslobj = None
+            for ca_name in certificate_authorities:
+                if not isinstance(ca_name, X509Name):
+                    raise TypeError(
+                        "client CAs must be X509Name objects, not %s "
+                        "objects" % (type(ca_name).__name__,)
+                    )
+                copy = _lib.X509_NAME_dup(ca_name._name)
+                _openssl_assert(copy != _ffi.NULL)
+                push_result = _lib.sk_X509_NAME_push(name_stack, copy)
+                if not push_result:
+                    _lib.X509_NAME_free(copy)
+                    _raise_current_error()
+        except Exception:
+            _lib.sk_X509_NAME_free(name_stack)
             raise
 
+        _lib.SSL_CTX_set_client_CA_list(self._context, name_stack)
+
+    def add_client_ca(self, certificate_authority):
+        """
+        Add the CA certificate to the list of preferred signers for this
+        context.
+
+        The list of certificate authorities will be sent to the client when the
+        server requests a client certificate.
+
+        :param certificate_authority: certificate authority's X509 certificate.
+        :return: None
+
+        .. versionadded:: 0.10
+        """
+        if not isinstance(certificate_authority, X509):
+            raise TypeError("certificate_authority must be an X509 instance")
+
+        add_result = _lib.SSL_CTX_add_client_CA(
+            self._context, certificate_authority._x509
+        )
+        _openssl_assert(add_result == 1)
+
+    def set_timeout(self, timeout):
+        """
+        Set the timeout for newly created sessions for this Context object to
+        *timeout*.  The default value is 300 seconds. See the OpenSSL manual
+        for more information (e.g. :manpage:`SSL_CTX_set_timeout(3)`).
+
+        :param timeout: The timeout in (whole) seconds
+        :return: The previous session timeout
+        """
+        if not isinstance(timeout, integer_types):
+            raise TypeError("timeout must be an integer")
+
+        return _lib.SSL_CTX_set_timeout(self._context, timeout)
+
+    def get_timeout(self):
+        """
+        Retrieve session timeout, as set by :meth:`set_timeout`. The default
+        is 300 seconds.
+
+        :return: The session timeout
+        """
+        return _lib.SSL_CTX_get_timeout(self._context)
+
+    def set_info_callback(self, callback):
+        """
+        Set the information callback to *callback*. This function will be
+        called from time to time during SSL handshakes.
+
+        :param callback: The Python callback to use.  This should take three
+            arguments: a Connection object and two integers.  The first integer
+            specifies where in the SSL handshake the function was called, and
+            the other the return code from a (possibly failed) internal
+            function call.
+        :return: None
+        """
+
+        @wraps(callback)
+        def wrapper(ssl, where, return_code):
+            callback(Connection._reverse_mapping[ssl], where, return_code)
+
+        self._info_callback = _ffi.callback(
+            "void (*)(const SSL *, int, int)", wrapper
+        )
+        _lib.SSL_CTX_set_info_callback(self._context, self._info_callback)
+
+    @_requires_keylog
+    def set_keylog_callback(self, callback):
+        """
+        Set the TLS key logging callback to *callback*. This function will be
+        called whenever TLS key material is generated or received, in order
+        to allow applications to store this keying material for debugging
+        purposes.
+
+        :param callback: The Python callback to use.  This should take two
+            arguments: a Connection object and a bytestring that contains
+            the key material in the format used by NSS for its SSLKEYLOGFILE
+            debugging output.
+        :return: None
+        """
+
+        @wraps(callback)
+        def wrapper(ssl, line):
+            line = _ffi.string(line)
+            callback(Connection._reverse_mapping[ssl], line)
+
+        self._keylog_callback = _ffi.callback(
+            "void (*)(const SSL *, const char *)", wrapper
+        )
+        _lib.SSL_CTX_set_keylog_callback(self._context, self._keylog_callback)
+
+    def get_app_data(self):
+        """
+        Get the application data (supplied via :meth:`set_app_data()`)
+
+        :return: The application data
+        """
+        return self._app_data
+
+    def set_app_data(self, data):
+        """
+        Set the application data (will be returned from get_app_data())
+
+        :param data: Any Python object
+        :return: None
+        """
+        self._app_data = data
+
+    def get_cert_store(self):
+        """
+        Get the certificate store for the context.  This can be used to add
+        "trusted" certificates without using the
+        :meth:`load_verify_locations` method.
+
+        :return: A X509Store object or None if it does not have one.
+        """
+        store = _lib.SSL_CTX_get_cert_store(self._context)
+        if store == _ffi.NULL:
+            # TODO: This is untested.
+            return None
+
+        pystore = X509Store.__new__(X509Store)
+        pystore._store = store
+        return pystore
+
+    def set_options(self, options):
+        """
+        Add options. Options set before are not cleared!
+        This method should be used with the :const:`OP_*` constants.
+
+        :param options: The options to add.
+        :return: The new option bitmask.
+        """
+        if not isinstance(options, integer_types):
+            raise TypeError("options must be an integer")
+
+        return _lib.SSL_CTX_set_options(self._context, options)
+
+    def set_mode(self, mode):
+        """
+        Add modes via bitmask. Modes set before are not cleared!  This method
+        should be used with the :const:`MODE_*` constants.
+
+        :param mode: The mode to add.
+        :return: The new mode bitmask.
+        """
+        if not isinstance(mode, integer_types):
+            raise TypeError("mode must be an integer")
+
+        return _lib.SSL_CTX_set_mode(self._context, mode)
+
+    def set_tlsext_servername_callback(self, callback):
+        """
+        Specify a callback function to be called when clients specify a server
+        name.
+
+        :param callback: The callback function.  It will be invoked with one
+            argument, the Connection instance.
+
+        .. versionadded:: 0.13
+        """
+
+        @wraps(callback)
+        def wrapper(ssl, alert, arg):
+            callback(Connection._reverse_mapping[ssl])
+            return 0
+
+        self._tlsext_servername_callback = _ffi.callback(
+            "int (*)(SSL *, int *, void *)", wrapper
+        )
+        _lib.SSL_CTX_set_tlsext_servername_callback(
+            self._context, self._tlsext_servername_callback
+        )
+
+    def set_tlsext_use_srtp(self, profiles):
+        """
+        Enable support for negotiating SRTP keying material.
+
+        :param bytes profiles: A colon delimited list of protection profile
+            names, like ``b'SRTP_AES128_CM_SHA1_80:SRTP_AES128_CM_SHA1_32'``.
+        :return: None
+        """
+        if not isinstance(profiles, bytes):
+            raise TypeError("profiles must be a byte string.")
+
+        _openssl_assert(
+            _lib.SSL_CTX_set_tlsext_use_srtp(self._context, profiles) == 0
+        )
+
+    @_requires_alpn
+    def set_alpn_protos(self, protos):
+        """
+        Specify the protocols that the client is prepared to speak after the
+        TLS connection has been negotiated using Application Layer Protocol
+        Negotiation.
+
+        :param protos: A list of the protocols to be offered to the server.
+            This list should be a Python list of bytestrings representing the
+            protocols to offer, e.g. ``[b'http/1.1', b'spdy/2']``.
+        """
+        # Take the list of protocols and join them together, prefixing them
+        # with their lengths.
+        protostr = b"".join(
+            chain.from_iterable((int2byte(len(p)), p) for p in protos)
+        )
+
+        # Build a C string from the list. We don't need to save this off
+        # because OpenSSL immediately copies the data out.
+        input_str = _ffi.new("unsigned char[]", protostr)
+        _lib.SSL_CTX_set_alpn_protos(self._context, input_str, len(protostr))
+
+    @_requires_alpn
+    def set_alpn_select_callback(self, callback):
+        """
+        Specify a callback function that will be called on the server when a
+        client offers protocols using ALPN.
+
+        :param callback: The callback function.  It will be invoked with two
+            arguments: the Connection, and a list of offered protocols as
+            bytestrings, e.g ``[b'http/1.1', b'spdy/2']``.  It can return
+            one of those bytestrings to indicate the chosen protocol, the
+            empty bytestring to terminate the TLS connection, or the
+            :py:obj:`NO_OVERLAPPING_PROTOCOLS` to indicate that no offered
+            protocol was selected, but that the connection should not be
+            aborted.
+        """
+        self._alpn_select_helper = _ALPNSelectHelper(callback)
+        self._alpn_select_callback = self._alpn_select_helper.callback
+        _lib.SSL_CTX_set_alpn_select_cb(
+            self._context, self._alpn_select_callback, _ffi.NULL
+        )
+
+    def _set_ocsp_callback(self, helper, data):
+        """
+        This internal helper does the common work for
+        ``set_ocsp_server_callback`` and ``set_ocsp_client_callback``, which is
+        almost all of it.
+        """
+        self._ocsp_helper = helper
+        self._ocsp_callback = helper.callback
+        if data is None:
+            self._ocsp_data = _ffi.NULL
+        else:
+            self._ocsp_data = _ffi.new_handle(data)
+
+        rc = _lib.SSL_CTX_set_tlsext_status_cb(
+            self._context, self._ocsp_callback
+        )
+        _openssl_assert(rc == 1)
+        rc = _lib.SSL_CTX_set_tlsext_status_arg(self._context, self._ocsp_data)
+        _openssl_assert(rc == 1)
+
+    def set_ocsp_server_callback(self, callback, data=None):
+        """
+        Set a callback to provide OCSP data to be stapled to the TLS handshake
+        on the server side.
+
+        :param callback: The callback function. It will be invoked with two
+            arguments: the Connection, and the optional arbitrary data you have
+            provided. The callback must return a bytestring that contains the
+            OCSP data to staple to the handshake. If no OCSP data is available
+            for this connection, return the empty bytestring.
+        :param data: Some opaque data that will be passed into the callback
+            function when called. This can be used to avoid needing to do
+            complex data lookups or to keep track of what context is being
+            used. This parameter is optional.
+        """
+        helper = _OCSPServerCallbackHelper(callback)
+        self._set_ocsp_callback(helper, data)
+
+    def set_ocsp_client_callback(self, callback, data=None):
+        """
+        Set a callback to validate OCSP data stapled to the TLS handshake on
+        the client side.
+
+        :param callback: The callback function. It will be invoked with three
+            arguments: the Connection, a bytestring containing the stapled OCSP
+            assertion, and the optional arbitrary data you have provided. The
+            callback must return a boolean that indicates the result of
+            validating the OCSP data: ``True`` if the OCSP data is valid and
+            the certificate can be trusted, or ``False`` if either the OCSP
+            data is invalid or the certificate has been revoked.
+        :param data: Some opaque data that will be passed into the callback
+            function when called. This can be used to avoid needing to do
+            complex data lookups or to keep track of what context is being
+            used. This parameter is optional.
+        """
+        helper = _OCSPClientCallbackHelper(callback)
+        self._set_ocsp_callback(helper, data)
+
+
+class Connection(object):
+    _reverse_mapping = WeakValueDictionary()
+
+    def __init__(self, context, socket=None):
+        """
+        Create a new Connection object, using the given OpenSSL.SSL.Context
+        instance and socket.
+
+        :param context: An SSL Context to use for this connection
+        :param socket: The socket to use for transport layer
+        """
+        if not isinstance(context, Context):
+            raise TypeError("context must be a Context instance")
+
+        ssl = _lib.SSL_new(context._context)
+        self._ssl = _ffi.gc(ssl, _lib.SSL_free)
+        # We set SSL_MODE_AUTO_RETRY to handle situations where OpenSSL returns
+        # an SSL_ERROR_WANT_READ when processing a non-application data packet
+        # even though there is still data on the underlying transport.
+        # See https://github.com/openssl/openssl/issues/6234 for more details.
+        _lib.SSL_set_mode(self._ssl, _lib.SSL_MODE_AUTO_RETRY)
+        self._context = context
+        self._app_data = None
+
+        # References to strings used for Application Layer Protocol
+        # Negotiation. These strings get copied at some point but it's well
+        # after the callback returns, so we have to hang them somewhere to
+        # avoid them getting freed.
+        self._alpn_select_callback_args = None
+
+        # Reference the verify_callback of the Context. This ensures that if
+        # set_verify is called again after the SSL object has been created we
+        # do not point to a dangling reference
+        self._verify_helper = context._verify_helper
+        self._verify_callback = context._verify_callback
+
+        self._reverse_mapping[self._ssl] = self
+
+        if socket is None:
+            self._socket = None
+            # Don't set up any gc for these, SSL_free will take care of them.
+            self._into_ssl = _lib.BIO_new(_lib.BIO_s_mem())
+            _openssl_assert(self._into_ssl != _ffi.NULL)
+
+            self._from_ssl = _lib.BIO_new(_lib.BIO_s_mem())
+            _openssl_assert(self._from_ssl != _ffi.NULL)
+
+            _lib.SSL_set_bio(self._ssl, self._into_ssl, self._from_ssl)
+        else:
+            self._into_ssl = None
+            self._from_ssl = None
+            self._socket = socket
+            set_result = _lib.SSL_set_fd(
+                self._ssl, _asFileDescriptor(self._socket)
+            )
+            _openssl_assert(set_result == 1)
+
+    def __getattr__(self, name):
+        """
+        Look up attributes on the wrapped socket object if they are not found
+        on the Connection object.
+        """
+        if self._socket is None:
+            raise AttributeError(
+                "'%s' object has no attribute '%s'"
+                % (self.__class__.__name__, name)
+            )
+        else:
+            return getattr(self._socket, name)
+
+    def _raise_ssl_error(self, ssl, result):
+        if self._context._verify_helper is not None:
+            self._context._verify_helper.raise_if_problem()
+        if self._context._alpn_select_helper is not None:
+            self._context._alpn_select_helper.raise_if_problem()
+        if self._context._ocsp_helper is not None:
+            self._context._ocsp_helper.raise_if_problem()
+
+        error = _lib.SSL_get_error(ssl, result)
+        if error == _lib.SSL_ERROR_WANT_READ:
+            raise WantReadError()
+        elif error == _lib.SSL_ERROR_WANT_WRITE:
+            raise WantWriteError()
+        elif error == _lib.SSL_ERROR_ZERO_RETURN:
+            raise ZeroReturnError()
+        elif error == _lib.SSL_ERROR_WANT_X509_LOOKUP:
+            # TODO: This is untested.
+            raise WantX509LookupError()
+        elif error == _lib.SSL_ERROR_SYSCALL:
+            if _lib.ERR_peek_error() == 0:
+                if result < 0:
+                    if platform == "win32":
+                        errno = _ffi.getwinerror()[0]
+                    else:
+                        errno = _ffi.errno
+
+                    if errno != 0:
+                        raise SysCallError(errno, errorcode.get(errno))
+                raise SysCallError(-1, "Unexpected EOF")
+            else:
+                # TODO: This is untested.
+                _raise_current_error()
+        elif error == _lib.SSL_ERROR_NONE:
+            pass
+        else:
+            _raise_current_error()
+
+    def get_context(self):
+        """
+        Retrieve the :class:`Context` object associated with this
+        :class:`Connection`.
+        """
+        return self._context
+
+    def set_context(self, context):
+        """
+        Switch this connection to a new session context.
+
+        :param context: A :class:`Context` instance giving the new session
+            context to use.
+        """
+        if not isinstance(context, Context):
+            raise TypeError("context must be a Context instance")
+
+        _lib.SSL_set_SSL_CTX(self._ssl, context._context)
+        self._context = context
+
+    def get_servername(self):
+        """
+        Retrieve the servername extension value if provided in the client hello
+        message, or None if there wasn't one.
+
+        :return: A byte string giving the server name or :data:`None`.
+
+        .. versionadded:: 0.13
+        """
+        name = _lib.SSL_get_servername(
+            self._ssl, _lib.TLSEXT_NAMETYPE_host_name
+        )
+        if name == _ffi.NULL:
+            return None
+
+        return _ffi.string(name)
+
+    def set_tlsext_host_name(self, name):
+        """
+        Set the value of the servername extension to send in the client hello.
+
+        :param name: A byte string giving the name.
+
+        .. versionadded:: 0.13
+        """
+        if not isinstance(name, bytes):
+            raise TypeError("name must be a byte string")
+        elif b"\0" in name:
+            raise TypeError("name must not contain NUL byte")
+
+        # XXX I guess this can fail sometimes?
+        _lib.SSL_set_tlsext_host_name(self._ssl, name)
+
+    def pending(self):
+        """
+        Get the number of bytes that can be safely read from the SSL buffer
+        (**not** the underlying transport buffer).
+
+        :return: The number of bytes available in the receive buffer.
+        """
+        return _lib.SSL_pending(self._ssl)
+
+    def send(self, buf, flags=0):
+        """
+        Send data on the connection. NOTE: If you get one of the WantRead,
+        WantWrite or WantX509Lookup exceptions on this, you have to call the
+        method again with the SAME buffer.
+
+        :param buf: The string, buffer or memoryview to send
+        :param flags: (optional) Included for compatibility with the socket
+                      API, the value is ignored
+        :return: The number of bytes written
+        """
+        # Backward compatibility
+        buf = _text_to_bytes_and_warn("buf", buf)
+
+        with _from_buffer(buf) as data:
+            # check len(buf) instead of len(data) for testability
+            if len(buf) > 2147483647:
+                raise ValueError(
+                    "Cannot send more than 2**31-1 bytes at once."
+                )
+
+            result = _lib.SSL_write(self._ssl, data, len(data))
+            self._raise_ssl_error(self._ssl, result)
+
+            return result
+
+    write = send
+
+    def sendall(self, buf, flags=0):
+        """
+        Send "all" data on the connection. This calls send() repeatedly until
+        all data is sent. If an error occurs, it's impossible to tell how much
+        data has been sent.
+
+        :param buf: The string, buffer or memoryview to send
+        :param flags: (optional) Included for compatibility with the socket
+                      API, the value is ignored
+        :return: The number of bytes written
+        """
+        buf = _text_to_bytes_and_warn("buf", buf)
+
+        with _from_buffer(buf) as data:
+
+            left_to_send = len(buf)
+            total_sent = 0
+
+            while left_to_send:
+                # SSL_write's num arg is an int,
+                # so we cannot send more than 2**31-1 bytes at once.
+                result = _lib.SSL_write(
+                    self._ssl, data + total_sent, min(left_to_send, 2147483647)
+                )
+                self._raise_ssl_error(self._ssl, result)
+                total_sent += result
+                left_to_send -= result
+
+            return total_sent
+
+    def recv(self, bufsiz, flags=None):
+        """
+        Receive data on the connection.
+
+        :param bufsiz: The maximum number of bytes to read
+        :param flags: (optional) The only supported flag is ``MSG_PEEK``,
+            all other flags are ignored.
+        :return: The string read from the Connection
+        """
+        buf = _no_zero_allocator("char[]", bufsiz)
+        if flags is not None and flags & socket.MSG_PEEK:
+            result = _lib.SSL_peek(self._ssl, buf, bufsiz)
+        else:
+            result = _lib.SSL_read(self._ssl, buf, bufsiz)
+        self._raise_ssl_error(self._ssl, result)
+        return _ffi.buffer(buf, result)[:]
+
+    read = recv
+
+    def recv_into(self, buffer, nbytes=None, flags=None):
+        """
+        Receive data on the connection and copy it directly into the provided
+        buffer, rather than creating a new string.
+
+        :param buffer: The buffer to copy into.
+        :param nbytes: (optional) The maximum number of bytes to read into the
+            buffer. If not present, defaults to the size of the buffer. If
+            larger than the size of the buffer, is reduced to the size of the
+            buffer.
+        :param flags: (optional) The only supported flag is ``MSG_PEEK``,
+            all other flags are ignored.
+        :return: The number of bytes read into the buffer.
+        """
+        if nbytes is None:
+            nbytes = len(buffer)
+        else:
+            nbytes = min(nbytes, len(buffer))
+
+        # We need to create a temporary buffer. This is annoying, it would be
+        # better if we could pass memoryviews straight into the SSL_read call,
+        # but right now we can't. Revisit this if CFFI gets that ability.
+        buf = _no_zero_allocator("char[]", nbytes)
+        if flags is not None and flags & socket.MSG_PEEK:
+            result = _lib.SSL_peek(self._ssl, buf, nbytes)
+        else:
+            result = _lib.SSL_read(self._ssl, buf, nbytes)
+        self._raise_ssl_error(self._ssl, result)
+
+        # This strange line is all to avoid a memory copy. The buffer protocol
+        # should allow us to assign a CFFI buffer to the LHS of this line, but
+        # on CPython 3.3+ that segfaults. As a workaround, we can temporarily
+        # wrap it in a memoryview.
+        buffer[:result] = memoryview(_ffi.buffer(buf, result))
+
+        return result
+
+    def _handle_bio_errors(self, bio, result):
+        if _lib.BIO_should_retry(bio):
+            if _lib.BIO_should_read(bio):
+                raise WantReadError()
+            elif _lib.BIO_should_write(bio):
+                # TODO: This is untested.
+                raise WantWriteError()
+            elif _lib.BIO_should_io_special(bio):
+                # TODO: This is untested.  I think io_special means the socket
+                # BIO has a not-yet connected socket.
+                raise ValueError("BIO_should_io_special")
+            else:
+                # TODO: This is untested.
+                raise ValueError("unknown bio failure")
+        else:
+            # TODO: This is untested.
+            _raise_current_error()
+
+    def bio_read(self, bufsiz):
+        """
+        If the Connection was created with a memory BIO, this method can be
+        used to read bytes from the write end of that memory BIO.  Many
+        Connection methods will add bytes which must be read in this manner or
+        the buffer will eventually fill up and the Connection will be able to
+        take no further actions.
+
+        :param bufsiz: The maximum number of bytes to read
+        :return: The string read.
+        """
+        if self._from_ssl is None:
+            raise TypeError("Connection sock was not None")
+
+        if not isinstance(bufsiz, integer_types):
+            raise TypeError("bufsiz must be an integer")
+
+        buf = _no_zero_allocator("char[]", bufsiz)
+        result = _lib.BIO_read(self._from_ssl, buf, bufsiz)
+        if result <= 0:
+            self._handle_bio_errors(self._from_ssl, result)
+
+        return _ffi.buffer(buf, result)[:]
+
+    def bio_write(self, buf):
+        """
+        If the Connection was created with a memory BIO, this method can be
+        used to add bytes to the read end of that memory BIO.  The Connection
+        can then read the bytes (for example, in response to a call to
+        :meth:`recv`).
+
+        :param buf: The string to put into the memory BIO.
+        :return: The number of bytes written
+        """
+        buf = _text_to_bytes_and_warn("buf", buf)
+
+        if self._into_ssl is None:
+            raise TypeError("Connection sock was not None")
+
+        with _from_buffer(buf) as data:
+            result = _lib.BIO_write(self._into_ssl, data, len(data))
+            if result <= 0:
+                self._handle_bio_errors(self._into_ssl, result)
+            return result
+
+    def renegotiate(self):
+        """
+        Renegotiate the session.
+
+        :return: True if the renegotiation can be started, False otherwise
+        :rtype: bool
+        """
+        if not self.renegotiate_pending():
+            _openssl_assert(_lib.SSL_renegotiate(self._ssl) == 1)
+            return True
+        return False
+
+    def do_handshake(self):
+        """
+        Perform an SSL handshake (usually called after :meth:`renegotiate` or
+        one of :meth:`set_accept_state` or :meth:`set_connect_state`). This can
+        raise the same exceptions as :meth:`send` and :meth:`recv`.
+
+        :return: None.
+        """
+        result = _lib.SSL_do_handshake(self._ssl)
+        self._raise_ssl_error(self._ssl, result)
+
+    def renegotiate_pending(self):
+        """
+        Check if there's a renegotiation in progress, it will return False once
+        a renegotiation is finished.
+
+        :return: Whether there's a renegotiation in progress
+        :rtype: bool
+        """
+        return _lib.SSL_renegotiate_pending(self._ssl) == 1
+
+    def total_renegotiations(self):
+        """
+        Find out the total number of renegotiations.
+
+        :return: The number of renegotiations.
+        :rtype: int
+        """
+        return _lib.SSL_total_renegotiations(self._ssl)
+
     def connect(self, addr):
-        """Connects to remote ADDR, and then wraps the connection in
-        an SSL channel."""
-        self._real_connect(addr, False)
+        """
+        Call the :meth:`connect` method of the underlying socket and set up SSL
+        on the socket, using the :class:`Context` object supplied to this
+        :class:`Connection` object at creation.
+
+        :param addr: A remote address
+        :return: What the socket's connect method returns
+        """
+        _lib.SSL_set_connect_state(self._ssl)
+        return self._socket.connect(addr)
 
     def connect_ex(self, addr):
-        """Connects to remote ADDR, and then wraps the connection in
-        an SSL channel."""
-        return self._real_connect(addr, True)
+        """
+        Call the :meth:`connect_ex` method of the underlying socket and set up
+        SSL on the socket, using the Context object supplied to this Connection
+        object at creation. Note that if the :meth:`connect_ex` method of the
+        socket doesn't return 0, SSL won't be initialized.
+
+        :param addr: A remove address
+        :return: What the socket's connect_ex method returns
+        """
+        connect_ex = self._socket.connect_ex
+        self.set_connect_state()
+        return connect_ex(addr)
 
     def accept(self):
-        """Accepts a new connection from a remote client, and returns
-        a tuple containing that new connection wrapped with a server-side
-        SSL channel, and the address of the remote client."""
+        """
+        Call the :meth:`accept` method of the underlying socket and set up SSL
+        on the returned socket, using the Context object supplied to this
+        :class:`Connection` object at creation.
 
-        newsock, addr = super().accept()
-        newsock = self.context.wrap_socket(newsock,
-                    do_handshake_on_connect=self.do_handshake_on_connect,
-                    suppress_ragged_eofs=self.suppress_ragged_eofs,
-                    server_side=True)
-        return newsock, addr
+        :return: A *(conn, addr)* pair where *conn* is the new
+            :class:`Connection` object created, and *address* is as returned by
+            the socket's :meth:`accept`.
+        """
+        client, addr = self._socket.accept()
+        conn = Connection(self._context, client)
+        conn.set_accept_state()
+        return (conn, addr)
 
-    @_sslcopydoc
-    def get_channel_binding(self, cb_type="tls-unique"):
-        if self._sslobj is not None:
-            return self._sslobj.get_channel_binding(cb_type)
+    def bio_shutdown(self):
+        """
+        If the Connection was created with a memory BIO, this method can be
+        used to indicate that *end of file* has been reached on the read end of
+        that memory BIO.
+
+        :return: None
+        """
+        if self._from_ssl is None:
+            raise TypeError("Connection sock was not None")
+
+        _lib.BIO_set_mem_eof_return(self._into_ssl, 0)
+
+    def shutdown(self):
+        """
+        Send the shutdown message to the Connection.
+
+        :return: True if the shutdown completed successfully (i.e. both sides
+                 have sent closure alerts), False otherwise (in which case you
+                 call :meth:`recv` or :meth:`send` when the connection becomes
+                 readable/writeable).
+        """
+        result = _lib.SSL_shutdown(self._ssl)
+        if result < 0:
+            self._raise_ssl_error(self._ssl, result)
+        elif result > 0:
+            return True
         else:
-            if cb_type not in CHANNEL_BINDING_TYPES:
-                raise ValueError(
-                    "{0} channel binding type not implemented".format(cb_type)
-                )
+            return False
+
+    def get_cipher_list(self):
+        """
+        Retrieve the list of ciphers used by the Connection object.
+
+        :return: A list of native cipher strings.
+        """
+        ciphers = []
+        for i in count():
+            result = _lib.SSL_get_cipher_list(self._ssl, i)
+            if result == _ffi.NULL:
+                break
+            ciphers.append(_native(_ffi.string(result)))
+        return ciphers
+
+    def get_client_ca_list(self):
+        """
+        Get CAs whose certificates are suggested for client authentication.
+
+        :return: If this is a server connection, the list of certificate
+            authorities that will be sent or has been sent to the client, as
+            controlled by this :class:`Connection`'s :class:`Context`.
+
+            If this is a client connection, the list will be empty until the
+            connection with the server is established.
+
+        .. versionadded:: 0.10
+        """
+        ca_names = _lib.SSL_get_client_CA_list(self._ssl)
+        if ca_names == _ffi.NULL:
+            # TODO: This is untested.
+            return []
+
+        result = []
+        for i in range(_lib.sk_X509_NAME_num(ca_names)):
+            name = _lib.sk_X509_NAME_value(ca_names, i)
+            copy = _lib.X509_NAME_dup(name)
+            _openssl_assert(copy != _ffi.NULL)
+
+            pyname = X509Name.__new__(X509Name)
+            pyname._name = _ffi.gc(copy, _lib.X509_NAME_free)
+            result.append(pyname)
+        return result
+
+    def makefile(self, *args, **kwargs):
+        """
+        The makefile() method is not implemented, since there is no dup
+        semantics for SSL connections
+
+        :raise: NotImplementedError
+        """
+        raise NotImplementedError(
+            "Cannot make file object of OpenSSL.SSL.Connection"
+        )
+
+    def get_app_data(self):
+        """
+        Retrieve application data as set by :meth:`set_app_data`.
+
+        :return: The application data
+        """
+        return self._app_data
+
+    def set_app_data(self, data):
+        """
+        Set application data
+
+        :param data: The application data
+        :return: None
+        """
+        self._app_data = data
+
+    def get_shutdown(self):
+        """
+        Get the shutdown state of the Connection.
+
+        :return: The shutdown state, a bitvector of SENT_SHUTDOWN,
+            RECEIVED_SHUTDOWN.
+        """
+        return _lib.SSL_get_shutdown(self._ssl)
+
+    def set_shutdown(self, state):
+        """
+        Set the shutdown state of the Connection.
+
+        :param state: bitvector of SENT_SHUTDOWN, RECEIVED_SHUTDOWN.
+        :return: None
+        """
+        if not isinstance(state, integer_types):
+            raise TypeError("state must be an integer")
+
+        _lib.SSL_set_shutdown(self._ssl, state)
+
+    def get_state_string(self):
+        """
+        Retrieve a verbose string detailing the state of the Connection.
+
+        :return: A string representing the state
+        :rtype: bytes
+        """
+        return _ffi.string(_lib.SSL_state_string_long(self._ssl))
+
+    def server_random(self):
+        """
+        Retrieve the random value used with the server hello message.
+
+        :return: A string representing the state
+        """
+        session = _lib.SSL_get_session(self._ssl)
+        if session == _ffi.NULL:
+            return None
+        length = _lib.SSL_get_server_random(self._ssl, _ffi.NULL, 0)
+        _openssl_assert(length > 0)
+        outp = _no_zero_allocator("unsigned char[]", length)
+        _lib.SSL_get_server_random(self._ssl, outp, length)
+        return _ffi.buffer(outp, length)[:]
+
+    def client_random(self):
+        """
+        Retrieve the random value used with the client hello message.
+
+        :return: A string representing the state
+        """
+        session = _lib.SSL_get_session(self._ssl)
+        if session == _ffi.NULL:
             return None
 
-    @_sslcopydoc
-    def version(self):
-        if self._sslobj is not None:
-            return self._sslobj.version()
-        else:
+        length = _lib.SSL_get_client_random(self._ssl, _ffi.NULL, 0)
+        _openssl_assert(length > 0)
+        outp = _no_zero_allocator("unsigned char[]", length)
+        _lib.SSL_get_client_random(self._ssl, outp, length)
+        return _ffi.buffer(outp, length)[:]
+
+    def master_key(self):
+        """
+        Retrieve the value of the master key for this session.
+
+        :return: A string representing the state
+        """
+        session = _lib.SSL_get_session(self._ssl)
+        if session == _ffi.NULL:
             return None
 
+        length = _lib.SSL_SESSION_get_master_key(session, _ffi.NULL, 0)
+        _openssl_assert(length > 0)
+        outp = _no_zero_allocator("unsigned char[]", length)
+        _lib.SSL_SESSION_get_master_key(session, outp, length)
+        return _ffi.buffer(outp, length)[:]
 
-# Python does not support forward declaration of types.
-SSLContext.sslsocket_class = SSLSocket
-SSLContext.sslobject_class = SSLObject
+    def export_keying_material(self, label, olen, context=None):
+        """
+        Obtain keying material for application use.
+
+        :param: label - a disambiguating label string as described in RFC 5705
+        :param: olen - the length of the exported key material in bytes
+        :param: context - a per-association context value
+        :return: the exported key material bytes or None
+        """
+        outp = _no_zero_allocator("unsigned char[]", olen)
+        context_buf = _ffi.NULL
+        context_len = 0
+        use_context = 0
+        if context is not None:
+            context_buf = context
+            context_len = len(context)
+            use_context = 1
+        success = _lib.SSL_export_keying_material(
+            self._ssl,
+            outp,
+            olen,
+            label,
+            len(label),
+            context_buf,
+            context_len,
+            use_context,
+        )
+        _openssl_assert(success == 1)
+        return _ffi.buffer(outp, olen)[:]
+
+    def sock_shutdown(self, *args, **kwargs):
+        """
+        Call the :meth:`shutdown` method of the underlying socket.
+        See :manpage:`shutdown(2)`.
+
+        :return: What the socket's shutdown() method returns
+        """
+        return self._socket.shutdown(*args, **kwargs)
+
+    def get_certificate(self):
+        """
+        Retrieve the local certificate (if any)
+
+        :return: The local certificate
+        """
+        cert = _lib.SSL_get_certificate(self._ssl)
+        if cert != _ffi.NULL:
+            _lib.X509_up_ref(cert)
+            return X509._from_raw_x509_ptr(cert)
+        return None
+
+    def get_peer_certificate(self):
+        """
+        Retrieve the other side's certificate (if any)
+
+        :return: The peer's certificate
+        """
+        cert = _lib.SSL_get_peer_certificate(self._ssl)
+        if cert != _ffi.NULL:
+            return X509._from_raw_x509_ptr(cert)
+        return None
+
+    @staticmethod
+    def _cert_stack_to_list(cert_stack):
+        """
+        Internal helper to convert a STACK_OF(X509) to a list of X509
+        instances.
+        """
+        result = []
+        for i in range(_lib.sk_X509_num(cert_stack)):
+            cert = _lib.sk_X509_value(cert_stack, i)
+            _openssl_assert(cert != _ffi.NULL)
+            res = _lib.X509_up_ref(cert)
+            _openssl_assert(res >= 1)
+            pycert = X509._from_raw_x509_ptr(cert)
+            result.append(pycert)
+        return result
+
+    def get_peer_cert_chain(self):
+        """
+        Retrieve the other side's certificate (if any)
+
+        :return: A list of X509 instances giving the peer's certificate chain,
+                 or None if it does not have one.
+        """
+        cert_stack = _lib.SSL_get_peer_cert_chain(self._ssl)
+        if cert_stack == _ffi.NULL:
+            return None
+
+        return self._cert_stack_to_list(cert_stack)
+
+    def get_verified_chain(self):
+        """
+        Retrieve the verified certificate chain of the peer including the
+        peer's end entity certificate. It must be called after a session has
+        been successfully established. If peer verification was not successful
+        the chain may be incomplete, invalid, or None.
+
+        :return: A list of X509 instances giving the peer's verified
+                 certificate chain, or None if it does not have one.
+
+        .. versionadded:: 20.0
+        """
+        # OpenSSL 1.1+
+        cert_stack = _lib.SSL_get0_verified_chain(self._ssl)
+        if cert_stack == _ffi.NULL:
+            return None
+
+        return self._cert_stack_to_list(cert_stack)
+
+    def want_read(self):
+        """
+        Checks if more data has to be read from the transport layer to complete
+        an operation.
+
+        :return: True iff more data has to be read
+        """
+        return _lib.SSL_want_read(self._ssl)
+
+    def want_write(self):
+        """
+        Checks if there is data to write to the transport layer to complete an
+        operation.
+
+        :return: True iff there is data to write
+        """
+        return _lib.SSL_want_write(self._ssl)
+
+    def set_accept_state(self):
+        """
+        Set the connection to work in server mode. The handshake will be
+        handled automatically by read/write.
+
+        :return: None
+        """
+        _lib.SSL_set_accept_state(self._ssl)
+
+    def set_connect_state(self):
+        """
+        Set the connection to work in client mode. The handshake will be
+        handled automatically by read/write.
+
+        :return: None
+        """
+        _lib.SSL_set_connect_state(self._ssl)
+
+    def get_session(self):
+        """
+        Returns the Session currently used.
+
+        :return: An instance of :class:`OpenSSL.SSL.Session` or
+            :obj:`None` if no session exists.
+
+        .. versionadded:: 0.14
+        """
+        session = _lib.SSL_get1_session(self._ssl)
+        if session == _ffi.NULL:
+            return None
+
+        pysession = Session.__new__(Session)
+        pysession._session = _ffi.gc(session, _lib.SSL_SESSION_free)
+        return pysession
+
+    def set_session(self, session):
+        """
+        Set the session to be used when the TLS/SSL connection is established.
+
+        :param session: A Session instance representing the session to use.
+        :returns: None
+
+        .. versionadded:: 0.14
+        """
+        if not isinstance(session, Session):
+            raise TypeError("session must be a Session instance")
+
+        result = _lib.SSL_set_session(self._ssl, session._session)
+        _openssl_assert(result == 1)
+
+    def _get_finished_message(self, function):
+        """
+        Helper to implement :meth:`get_finished` and
+        :meth:`get_peer_finished`.
+
+        :param function: Either :data:`SSL_get_finished`: or
+            :data:`SSL_get_peer_finished`.
+
+        :return: :data:`None` if the desired message has not yet been
+            received, otherwise the contents of the message.
+        :rtype: :class:`bytes` or :class:`NoneType`
+        """
+        # The OpenSSL documentation says nothing about what might happen if the
+        # count argument given is zero.  Specifically, it doesn't say whether
+        # the output buffer may be NULL in that case or not.  Inspection of the
+        # implementation reveals that it calls memcpy() unconditionally.
+        # Section 7.1.4, paragraph 1 of the C standard suggests that
+        # memcpy(NULL, source, 0) is not guaranteed to produce defined (let
+        # alone desirable) behavior (though it probably does on just about
+        # every implementation...)
+        #
+        # Allocate a tiny buffer to pass in (instead of just passing NULL as
+        # one might expect) for the initial call so as to be safe against this
+        # potentially undefined behavior.
+        empty = _ffi.new("char[]", 0)
+        size = function(self._ssl, empty, 0)
+        if size == 0:
+            # No Finished message so far.
+            return None
+
+        buf = _no_zero_allocator("char[]", size)
+        function(self._ssl, buf, size)
+        return _ffi.buffer(buf, size)[:]
+
+    def get_finished(self):
+        """
+        Obtain the latest TLS Finished message that we sent.
+
+        :return: The contents of the message or :obj:`None` if the TLS
+            handshake has not yet completed.
+        :rtype: :class:`bytes` or :class:`NoneType`
+
+        .. versionadded:: 0.15
+        """
+        return self._get_finished_message(_lib.SSL_get_finished)
+
+    def get_peer_finished(self):
+        """
+        Obtain the latest TLS Finished message that we received from the peer.
+
+        :return: The contents of the message or :obj:`None` if the TLS
+            handshake has not yet completed.
+        :rtype: :class:`bytes` or :class:`NoneType`
+
+        .. versionadded:: 0.15
+        """
+        return self._get_finished_message(_lib.SSL_get_peer_finished)
+
+    def get_cipher_name(self):
+        """
+        Obtain the name of the currently used cipher.
+
+        :returns: The name of the currently used cipher or :obj:`None`
+            if no connection has been established.
+        :rtype: :class:`unicode` or :class:`NoneType`
+
+        .. versionadded:: 0.15
+        """
+        cipher = _lib.SSL_get_current_cipher(self._ssl)
+        if cipher == _ffi.NULL:
+            return None
+        else:
+            name = _ffi.string(_lib.SSL_CIPHER_get_name(cipher))
+            return name.decode("utf-8")
+
+    def get_cipher_bits(self):
+        """
+        Obtain the number of secret bits of the currently used cipher.
+
+        :returns: The number of secret bits of the currently used cipher
+            or :obj:`None` if no connection has been established.
+        :rtype: :class:`int` or :class:`NoneType`
+
+        .. versionadded:: 0.15
+        """
+        cipher = _lib.SSL_get_current_cipher(self._ssl)
+        if cipher == _ffi.NULL:
+            return None
+        else:
+            return _lib.SSL_CIPHER_get_bits(cipher, _ffi.NULL)
+
+    def get_cipher_version(self):
+        """
+        Obtain the protocol version of the currently used cipher.
+
+        :returns: The protocol name of the currently used cipher
+            or :obj:`None` if no connection has been established.
+        :rtype: :class:`unicode` or :class:`NoneType`
+
+        .. versionadded:: 0.15
+        """
+        cipher = _lib.SSL_get_current_cipher(self._ssl)
+        if cipher == _ffi.NULL:
+            return None
+        else:
+            version = _ffi.string(_lib.SSL_CIPHER_get_version(cipher))
+            return version.decode("utf-8")
+
+    def get_protocol_version_name(self):
+        """
+        Retrieve the protocol version of the current connection.
+
+        :returns: The TLS version of the current connection, for example
+            the value for TLS 1.2 would be ``TLSv1.2``or ``Unknown``
+            for connections that were not successfully established.
+        :rtype: :class:`unicode`
+        """
+        version = _ffi.string(_lib.SSL_get_version(self._ssl))
+        return version.decode("utf-8")
+
+    def get_protocol_version(self):
+        """
+        Retrieve the SSL or TLS protocol version of the current connection.
+
+        :returns: The TLS version of the current connection.  For example,
+            it will return ``0x769`` for connections made over TLS version 1.
+        :rtype: :class:`int`
+        """
+        version = _lib.SSL_version(self._ssl)
+        return version
+
+    @_requires_alpn
+    def set_alpn_protos(self, protos):
+        """
+        Specify the client's ALPN protocol list.
+
+        These protocols are offered to the server during protocol negotiation.
+
+        :param protos: A list of the protocols to be offered to the server.
+            This list should be a Python list of bytestrings representing the
+            protocols to offer, e.g. ``[b'http/1.1', b'spdy/2']``.
+        """
+        # Take the list of protocols and join them together, prefixing them
+        # with their lengths.
+        protostr = b"".join(
+            chain.from_iterable((int2byte(len(p)), p) for p in protos)
+        )
+
+        # Build a C string from the list. We don't need to save this off
+        # because OpenSSL immediately copies the data out.
+        input_str = _ffi.new("unsigned char[]", protostr)
+        _lib.SSL_set_alpn_protos(self._ssl, input_str, len(protostr))
+
+    @_requires_alpn
+    def get_alpn_proto_negotiated(self):
+        """
+        Get the protocol that was negotiated by ALPN.
+
+        :returns: A bytestring of the protocol name.  If no protocol has been
+            negotiated yet, returns an empty string.
+        """
+        data = _ffi.new("unsigned char **")
+        data_len = _ffi.new("unsigned int *")
+
+        _lib.SSL_get0_alpn_selected(self._ssl, data, data_len)
+
+        if not data_len:
+            return b""
+
+        return _ffi.buffer(data[0], data_len[0])[:]
+
+    def request_ocsp(self):
+        """
+        Called to request that the server sends stapled OCSP data, if
+        available. If this is not called on the client side then the server
+        will not send OCSP data. Should be used in conjunction with
+        :meth:`Context.set_ocsp_client_callback`.
+        """
+        rc = _lib.SSL_set_tlsext_status_type(
+            self._ssl, _lib.TLSEXT_STATUSTYPE_ocsp
+        )
+        _openssl_assert(rc == 1)
 
 
-def wrap_socket(sock, keyfile=None, certfile=None,
-                server_side=False, cert_reqs=CERT_NONE,
-                ssl_version=PROTOCOL_TLS, ca_certs=None,
-                do_handshake_on_connect=True,
-                suppress_ragged_eofs=True,
-                ciphers=None):
-
-    if server_side and not certfile:
-        raise ValueError("certfile must be specified for server-side "
-                         "operations")
-    if keyfile and not certfile:
-        raise ValueError("certfile must be specified")
-    context = SSLContext(ssl_version)
-    context.verify_mode = cert_reqs
-    if ca_certs:
-        context.load_verify_locations(ca_certs)
-    if certfile:
-        context.load_cert_chain(certfile, keyfile)
-    if ciphers:
-        context.set_ciphers(ciphers)
-    return context.wrap_socket(
-        sock=sock, server_side=server_side,
-        do_handshake_on_connect=do_handshake_on_connect,
-        suppress_ragged_eofs=suppress_ragged_eofs
-    )
-
-# some utility functions
-
-def cert_time_to_seconds(cert_time):
-    """Return the time in seconds since the Epoch, given the timestring
-    representing the "notBefore" or "notAfter" date from a certificate
-    in ``"%b %d %H:%M:%S %Y %Z"`` strptime format (C locale).
-
-    "notBefore" or "notAfter" dates must use UTC (RFC 5280).
-
-    Month is one of: Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec
-    UTC should be specified as GMT (see ASN1_TIME_print())
-    """
-    from time import strptime
-    from calendar import timegm
-
-    months = (
-        "Jan","Feb","Mar","Apr","May","Jun",
-        "Jul","Aug","Sep","Oct","Nov","Dec"
-    )
-    time_format = ' %d %H:%M:%S %Y GMT' # NOTE: no month, fixed GMT
-    try:
-        month_number = months.index(cert_time[:3].title()) + 1
-    except ValueError:
-        raise ValueError('time data %r does not match '
-                         'format "%%b%s"' % (cert_time, time_format))
-    else:
-        # found valid month
-        tt = strptime(cert_time[3:], time_format)
-        # return an integer, the previous mktime()-based implementation
-        # returned a float (fractional seconds are always zero here).
-        return timegm((tt[0], month_number) + tt[2:6])
-
-PEM_HEADER = "-----BEGIN CERTIFICATE-----"
-PEM_FOOTER = "-----END CERTIFICATE-----"
-
-def DER_cert_to_PEM_cert(der_cert_bytes):
-    """Takes a certificate in binary DER format and returns the
-    PEM version of it as a string."""
-
-    f = str(base64.standard_b64encode(der_cert_bytes), 'ASCII', 'strict')
-    ss = [PEM_HEADER]
-    ss += [f[i:i+64] for i in range(0, len(f), 64)]
-    ss.append(PEM_FOOTER + '\n')
-    return '\n'.join(ss)
-
-def PEM_cert_to_DER_cert(pem_cert_string):
-    """Takes a certificate in ASCII PEM format and returns the
-    DER-encoded version of it as a byte sequence"""
-
-    if not pem_cert_string.startswith(PEM_HEADER):
-        raise ValueError("Invalid PEM encoding; must start with %s"
-                         % PEM_HEADER)
-    if not pem_cert_string.strip().endswith(PEM_FOOTER):
-        raise ValueError("Invalid PEM encoding; must end with %s"
-                         % PEM_FOOTER)
-    d = pem_cert_string.strip()[len(PEM_HEADER):-len(PEM_FOOTER)]
-    return base64.decodebytes(d.encode('ASCII', 'strict'))
-
-def get_server_certificate(addr, ssl_version=PROTOCOL_TLS, ca_certs=None):
-    """Retrieve the certificate from the server at the specified address,
-    and return it as a PEM-encoded string.
-    If 'ca_certs' is specified, validate the server cert against it.
-    If 'ssl_version' is specified, use it in the connection attempt."""
-
-    host, port = addr
-    if ca_certs is not None:
-        cert_reqs = CERT_REQUIRED
-    else:
-        cert_reqs = CERT_NONE
-    context = _create_stdlib_context(ssl_version,
-                                     cert_reqs=cert_reqs,
-                                     cafile=ca_certs)
-    with  create_connection(addr) as sock:
-        with context.wrap_socket(sock) as sslsock:
-            dercert = sslsock.getpeercert(True)
-    return DER_cert_to_PEM_cert(dercert)
-
-def get_protocol_name(protocol_code):
-    return _PROTOCOL_NAMES.get(protocol_code, '<unknown>')
+# This is similar to the initialization calls at the end of OpenSSL/crypto.py
+# but is exercised mostly by the Context initializer.
+_lib.SSL_library_init()
