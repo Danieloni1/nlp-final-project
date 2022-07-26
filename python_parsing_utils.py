@@ -1,6 +1,6 @@
 import ast
 import json
-from typing import Optional
+from typing import Optional, Union
 
 UP = "UP"
 DOWN = "DOWN"
@@ -16,10 +16,9 @@ def parse_functions(file_path: str) -> dict:
         funcs = json.load(f)
     parsed = {}
     bad = []
-    for func in list(funcs.keys())[:100]:
+    for func in list(funcs.keys())[:200]:
         try:
             parsed_func = ast.parse(func)
-            # parsed[parsed_func] = funcs[func]
             parsed[parsed_func] = funcs[func]
         except Exception as e:
             bad.append(funcs[func])
@@ -27,12 +26,12 @@ def parse_functions(file_path: str) -> dict:
     return parsed
 
 
-def get_terminal_nodes(node: ast.AST) -> list:
+def get_terminal_nodes(node: ast.AST) -> tuple:
     terminals = []
     for child in ast.walk(node):
         if isinstance(child, ast.Name):
             terminals.append(child)
-    return terminals
+    return tuple(terminals)
 
 
 def terminal_to_value(terminal: ast.Name) -> str:
@@ -52,7 +51,7 @@ def non_terminal_to_value(non_terminal: ast.AST) -> str:
     return non_terminal.__class__.__name__
 
 
-def get_path(root: ast.AST, first: ast.AST, last: ast.AST) -> list:
+def get_path(root: ast.AST, first: ast.AST, last: ast.AST) -> tuple:
     """
     Returns a list of nodes from first to last in the following format:
         [first, UP, node1, ..., closest_common_parent_node, DOWN, ...,  last]
@@ -61,18 +60,18 @@ def get_path(root: ast.AST, first: ast.AST, last: ast.AST) -> list:
     :param last:
     :return: path from first to last as a list of nodes.
     """
-    path = [first]
+    path = [first.__class__.__name__]
     closest_common_parent = get_closest_common_parent(root, first, last)
     up_path = get_path_from_node_to_root(closest_common_parent, first)
     for node in up_path[1:]:
         path.append(UP)
-        path.append(node)
+        path.append(node.__class__.__name__)
     down_path = get_path_from_node_to_root(closest_common_parent, last)
     down_path.reverse()
     for node in down_path[1:]:
         path.append(DOWN)
-        path.append(node)
-    return path
+        path.append(node.__class__.__name__)
+    return tuple(path)
 
 
 def get_path_context(root: ast.AST, first: ast.Name, last: ast.Name) -> tuple:
@@ -106,13 +105,20 @@ def set_parents(root: ast.AST):
             child.parent = node
 
 
-def get_t_pairs(node: ast.AST):
+def get_t_pairs(node: ast.AST, max_pairs: int = 100) -> list:
     terminals = get_terminal_nodes(node)
-    return [(a, b) for idx, a in enumerate(terminals) for b in terminals[idx + 1:]]
+    return [(a, b) for idx, a in enumerate(terminals) for b in terminals[idx + 1:]][:max_pairs]
 
 
-if __name__ == '__main__':
-    parsed_funcs = parse_functions("./data/python.json")
-    parsed_func = list(parsed_funcs.keys())[1]
-    t_pairs = get_t_pairs(parsed_func)
-    path_context = get_path_context(parsed_func, t_pairs[0][0], t_pairs[0][1])
+def get_input_representation(function: Union[str, ast.AST], number_of_contexts: int = 10) -> tuple:
+    function_ast = ast.parse(function) if isinstance(function, str) else function
+    rep = set()
+    fails = 0
+    for pair in get_t_pairs(function_ast)[:number_of_contexts]:
+        try:
+            rep.add(get_path_context(function_ast, pair[0], pair[1]))
+        except Exception as e:
+            fails += 1
+    if fails:
+        print(f"{fails}/{number_of_contexts} contexts failed to parse")
+    return tuple(rep)
