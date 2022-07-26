@@ -1,8 +1,11 @@
 import json
 import os
+import time
 from typing import List, Tuple
 
 from preprocessor import Preprocessor
+from python_parsing_utils import parse_functions, get_input_representation
+from python_vocabs import create_value_vocab, create_path_vocab, create_tag_vocab
 
 PYTHON_DATA_PATH = "data/raw_data/python"
 
@@ -83,6 +86,30 @@ class PythonPreprocessor(Preprocessor):
     def extract_name(function: str) -> str:
         function_list = function.split("\n")
         return function_list[0].split("(")[0].split(" ")[1]
+
+
+def prepare_data(file_path: str) -> tuple:
+    """
+    Prepares data for training.
+    :param file_path: json file path containing functions as strings and their names.
+    :return: tuple of:
+        [0] dictionary of functions as reps and their names.
+        [1] dictionary of values and their indices.
+        [2] dictionary of paths and their indices.
+        [3] dictionary of tags and their indices.
+    """
+    start = time.time()
+    funcs = parse_functions(file_path)
+    data = {}
+    for func in list(funcs.keys()):
+        rep = get_input_representation(func)
+        if rep:
+            data[rep] = funcs[func]
+    value_vocab = create_value_vocab(data)
+    path_vocab = create_path_vocab(data)
+
+    print("Preprocessing took {} seconds.".format(time.time() - start))
+    return data, value_vocab, path_vocab, create_tag_vocab(data)
 
 
 if __name__ == '__main__':
