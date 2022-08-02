@@ -16,7 +16,7 @@ def parse_functions(file_path: str) -> dict:
         funcs = json.load(f)
     parsed = {}
     bad = []
-    for func in list(funcs.keys())[:200]:
+    for func in list(funcs.keys()):
         try:
             parsed_func = ast.parse(func)
             parsed[parsed_func] = funcs[func]
@@ -110,15 +110,22 @@ def get_t_pairs(node: ast.AST, max_pairs: int = 100) -> list:
     return [(a, b) for idx, a in enumerate(terminals) for b in terminals[idx + 1:]][:max_pairs]
 
 
-def get_input_representation(function: Union[str, ast.AST], number_of_contexts: int = 10) -> tuple:
+def get_input_representation(function: Union[str, ast.AST], rep_size: int = 10) -> tuple:
     function_ast = ast.parse(function) if isinstance(function, str) else function
     rep = set()
     fails = 0
-    for pair in get_t_pairs(function_ast)[:number_of_contexts]:
+    for pair in get_t_pairs(function_ast)[:rep_size]:
         try:
             rep.add(get_path_context(function_ast, pair[0], pair[1]))
         except Exception as e:
             fails += 1
+    rep = pad_input_representation_if_necessary(tuple(rep), rep_size)
     if fails:
-        print(f"{fails}/{number_of_contexts} contexts failed to parse")
+        print(f"{fails}/{rep_size} contexts failed to parse")
     return tuple(rep)
+
+
+def pad_input_representation_if_necessary(input_representation: tuple, rep_size: int = 10) -> tuple:
+    while len(input_representation) < rep_size:
+        input_representation = input_representation + (("", "", ""),)
+    return input_representation

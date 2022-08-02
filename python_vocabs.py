@@ -5,8 +5,8 @@ def create_value_vocab(data: dict) -> dict:
     :param data:
     :return: dict of terminals and their indices.
     """
-    vocab = {}
-    counter = 0
+    vocab = {"": 0}
+    counter = 1
     for rep, name in data.items():
         if rep:
             for val1, _, val2 in rep:
@@ -23,8 +23,8 @@ def create_value_vocab(data: dict) -> dict:
 
 
 def create_path_vocab(data: dict) -> dict:
-    vocab = {}
-    counter = 0
+    vocab = {"": 0}
+    counter = 1
     for rep, name in data.items():
         if rep:
             for val1, path, val2 in rep:

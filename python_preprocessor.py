@@ -88,28 +88,35 @@ class PythonPreprocessor(Preprocessor):
         return function_list[0].split("(")[0].split(" ")[1]
 
 
-def prepare_data(file_path: str) -> tuple:
+def prepare_data(file_path: str, rep_size=10) -> tuple:
     """
     Prepares data for training.
+    :param rep_size: number of contexts to use for each instance.
     :param file_path: json file path containing functions as strings and their names.
     :return: tuple of:
-        [0] dictionary of functions as reps and their names.
-        [1] dictionary of values and their indices.
-        [2] dictionary of paths and their indices.
-        [3] dictionary of tags and their indices.
+        [0] dictionary of training data: functions as reps and their names.
+        [1] dictionary of validation data: functions as reps and their names.
+        [2] dictionary of test data: functions as reps and their names.
+        [3] dictionary of values and their indices.
+        [4] dictionary of paths and their indices.
+        [5] dictionary of tags and their indices.
     """
     start = time.time()
     funcs = parse_functions(file_path)
     data = {}
     for func in list(funcs.keys()):
-        rep = get_input_representation(func)
+        rep = get_input_representation(func, rep_size)
         if rep:
             data[rep] = funcs[func]
     value_vocab = create_value_vocab(data)
     path_vocab = create_path_vocab(data)
+    tag_vocab = create_tag_vocab(data)
 
     print("Preprocessing took {} seconds.".format(time.time() - start))
-    return data, value_vocab, path_vocab, create_tag_vocab(data)
+    training_data = dict(list(data.items())[:int(len(data) * 0.8)])
+    validation_data = dict(list(data.items())[int(len(data) * 0.8):int(len(data) * 0.85)])
+    test_data = dict(list(data.items())[int(len(data) * 0.85):])
+    return training_data, validation_data, test_data, value_vocab, path_vocab, tag_vocab
 
 
 if __name__ == '__main__':
