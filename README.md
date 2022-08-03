@@ -4,7 +4,7 @@
 
 This project introduces a discriminative language model aimed to predict functions names given functions bodies and signatures.
 
-<Add link to paper>
+[Link to associated paper](https://drive.google.com/file/d/1FJF0chzvxk4qHbRRJinoyHnF-JE8FOWq/view?usp=sharing)
 
 ### Tasks list
 - [x] Collect Python stdlibs.
