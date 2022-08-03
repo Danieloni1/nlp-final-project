@@ -65,6 +65,18 @@ def train_loop(net, n_epochs, training_set):
         print(f"EPOCH: {e}, loss: {loss}")
 
 
+def evaluate(net, test_set):
+    correct = 0
+    total = 0
+    for func, label in test_set.items():
+        pred = net(func).to(device)
+        pred_tag = index_to_tag(torch.argmax(pred), net.tag_vocab)
+        if pred_tag == label:
+            correct += 1
+        total += 1
+    return correct / total
+
+
 def index_to_tag(index, vocab):
     for tag, i in vocab.items():
         if i == index:
