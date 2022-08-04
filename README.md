@@ -4,6 +4,8 @@
 
 This project introduces a discriminative language model aimed to predict functions names given functions bodies and signatures.
 
+Running the code is as simple as running main in the `python_model.py` file. Data is already preprocessed and stored in the `data/` folder.
+
 [Link to associated paper](https://drive.google.com/file/d/1FJF0chzvxk4qHbRRJinoyHnF-JE8FOWq/view?usp=sharing)
 
 ### Tasks list
